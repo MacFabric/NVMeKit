@@ -1,8 +1,7 @@
 import Foundation
 import Testing
-@testable import MockTarget
+@testable import NVMeMockTarget
 @testable import NVMeKit
-@testable import iSCSIKit
 
 /// `WriteConcurrencyTests` over NVMe/TCP: chunks of one write are issued
 /// together, bounded by `maxChunksInFlight`, measured by counting the

@@ -1,6 +1,5 @@
 import Foundation
 import NVMeKit
-import iSCSIKit
 
 /// What the simulated NVMe/TCP subsystem looks like to a host. Every knob
 /// has the value nvmet would give a plain zvol namespace, so the default

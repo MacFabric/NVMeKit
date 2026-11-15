@@ -1,9 +1,8 @@
 #if canImport(Network)
 import Foundation
 import Testing
-@testable import MockTarget
+@testable import NVMeMockTarget
 @testable import NVMeKit
-@testable import iSCSIKit
 
 /// End-to-end over a real loopback TCP socket, exercising `NetworkTransport`
 /// (the code path used against the NAS) with both digests on, through the

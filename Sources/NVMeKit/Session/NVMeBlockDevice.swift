@@ -1,5 +1,4 @@
 import Foundation
-import iSCSIKit
 
 /// A linear, byte-addressable block device backed by one NVMe namespace —
 /// the `ISCSIBlockDevice` twin, with the same chunking, the same in-flight

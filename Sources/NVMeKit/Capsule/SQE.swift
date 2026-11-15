@@ -1,5 +1,4 @@
 import Foundation
-import iSCSIKit
 
 /// The SGL descriptor at bytes 24–39 of an SQE. NVMe/TCP uses exactly two
 /// encodings (NVMe/TCP 1.0 §3.4.2): an SGL Data Block descriptor with the

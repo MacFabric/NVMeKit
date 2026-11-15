@@ -1,5 +1,4 @@
 import Foundation
-import iSCSIKit
 
 /// Pure parsers for the data structures the controller returns. All static
 /// or `init(data:)` over bytes, so the fuzzer can reach every one without a

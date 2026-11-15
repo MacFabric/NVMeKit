@@ -1,7 +1,6 @@
 import Foundation
 import Synchronization
 import Testing
-import iSCSIKit
 @testable import NVMeKit
 
 private final class TraceLines: Sendable {
@@ -95,7 +94,7 @@ private final class TraceSession {
         try await session.send(sqe)
         try await session.respond(4, status: NVMeStatus(sct: 1, sc: 0x84))
         #expect(session.matching("authentication required").count == 1)
-        #expect(session.matching("refused this Mac's host NQN").count == 1)
+        #expect(session.matching("failed: sct 0x01 sc 0x84 opcode 0x7f").count == 1)
         #expect(session.matching(" ok").isEmpty)
     }
 

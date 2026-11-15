@@ -1,5 +1,4 @@
 import Foundation
-import iSCSIKit
 
 /// Little-endian, slice-tolerant accessors over `Data`, the NVMe/TCP
 /// counterpart of iSCSIKit's big-endian `beU16`/`setBE32` family (which this

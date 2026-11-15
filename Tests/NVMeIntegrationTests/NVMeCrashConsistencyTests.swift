@@ -1,8 +1,7 @@
 import Foundation
 import Testing
-@testable import MockTarget
+@testable import NVMeMockTarget
 @testable import NVMeKit
-@testable import iSCSIKit
 
 /// The iSCSI crash-consistency proof, over NVMe/TCP: FUA on Write (CDW12 bit
 /// 30) and the Flush command must reach stable media the way the SCSI FUA

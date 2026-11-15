@@ -1,5 +1,4 @@
 import Foundation
-import iSCSIKit
 
 /// NVMe-oF discovery: an admin-only controller on the well-known discovery
 /// NQN, brought up like any other (CC.EN, CSTS.RDY), then the Discovery

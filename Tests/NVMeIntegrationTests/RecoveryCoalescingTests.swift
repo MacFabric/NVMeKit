@@ -1,8 +1,7 @@
 import Foundation
 import Testing
-@testable import MockTarget
+@testable import NVMeMockTarget
 @testable import NVMeKit
-@testable import iSCSIKit
 
 /// Concurrent failures must coalesce onto ONE recovery.
 ///
@@ -83,33 +82,6 @@ struct RecoveryCoalescingTests {
         #expect(counter.connectionLost == 1)
         #expect(counter.recoveries == 1)
         #expect(await controller.recoveryCount == 1)
-        await fleet.shutdown()
-    }
-
-    @Test func iscsiConcurrentFailuresCoalesceOntoOneRecovery() async throws {
-        var dropping = MockTargetConfig()
-        dropping.faults.dropAfterSentPDUs = 1
-        let fleet = TargetFleet(configs: [dropping, MockTargetConfig()])
-        let session = ISCSISession(login: standardLogin(),
-                                   policy: testPolicy(),
-                                   transportFactory: { await fleet.makeTransport() })
-        let counter = EventCounter()
-        await session.setEventHandler { counter.note($0) }
-        try await session.activate()
-
-        let device = ISCSIBlockDevice(session: session, lun: 0)
-        _ = try await device.readCapacity()
-
-        let payload = Data(repeating: 0x3C, count: 4096)
-        await withTaskGroup(of: Void.self) { group in
-            for i in 0 ..< 8 {
-                group.addTask { try? await device.write(offset: UInt64(i) * 4096, data: payload) }
-            }
-        }
-
-        #expect(counter.connectionLost == 1)
-        #expect(counter.recoveries == 1)
-        #expect(await session.recoveryCount == 1)
         await fleet.shutdown()
     }
 }

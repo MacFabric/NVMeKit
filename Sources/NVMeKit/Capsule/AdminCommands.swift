@@ -1,5 +1,4 @@
 import Foundation
-import iSCSIKit
 
 public enum NVMeOpcode {
     public enum Admin {

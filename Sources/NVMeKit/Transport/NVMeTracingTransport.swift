@@ -1,5 +1,4 @@
 import Foundation
-import iSCSIKit
 
 /// Describes queue operations and their outcomes. Debug tracing also reports the
 /// wire fields, including the controller's original status on locally failed reads.
@@ -7,6 +6,7 @@ public final class NVMeTracingTransport: ConnectionTransport, @unchecked Sendabl
     private let inner: any ConnectionTransport
     private let label: String
     private let sink: @Sendable (String) -> Void
+    private let describeFailure: @Sendable (BlockDeviceError) -> String
     public enum Level: Sendable { case useful, debug }
     private let level: Level
     private var queueID: UInt16 = 0
@@ -23,12 +23,23 @@ public final class NVMeTracingTransport: ConnectionTransport, @unchecked Sendabl
         _ inner: any ConnectionTransport,
         label: String = "nvme",
         level: Level = .debug,
-        sink: @escaping @Sendable (String) -> Void = { FileHandle.standardError.write(Data(($0 + "\n").utf8)) }
+        sink: @escaping @Sendable (String) -> Void = { FileHandle.standardError.write(Data(($0 + "\n").utf8)) },
+        describeFailure: @escaping @Sendable (BlockDeviceError) -> String = NVMeTracingTransport.statusDescription
     ) {
         self.level = level
         self.inner = inner
         self.label = label
+        self.describeFailure = describeFailure
         self.sink = sink
+    }
+
+    /// The default wording for a failed completion: the status fields as the
+    /// specification names them. A caller with something better to say to
+    /// its own users — which subsystem setting to change, say — passes its
+    /// own `describeFailure`.
+    public static func statusDescription(_ error: BlockDeviceError) -> String {
+        guard case .nvmeStatus(let sct, let sc, let opcode) = error else { return "\(error)" }
+        return String(format: "sct 0x%02x sc 0x%02x opcode 0x%02x", sct, sc, opcode)
     }
 
     public func send(_ data: Data) async throws {
@@ -158,7 +169,7 @@ public final class NVMeTracingTransport: ConnectionTransport, @unchecked Sendabl
         let prefix = "cid=\(cqe.commandID) \(operation(sqe))"
         if !cqe.status.isSuccess {
             let error = BlockDeviceError.nvmeStatus(sct: cqe.status.sct, sc: cqe.status.sc, opcode: sqe.opcode)
-            return prefix + " failed: " + ISCSIError.nsError(from: error).localizedDescription
+            return prefix + " failed: " + describeFailure(error)
         }
         if badDigest { return prefix + " failed: data digest mismatch" }
         // Bits 1:0 of an opcode give its direction; 10b is controller to host.

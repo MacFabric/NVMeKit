@@ -1,6 +1,5 @@
 import Foundation
 import Testing
-import iSCSIKit
 @testable import NVMeKit
 
 @Suite("SQE, SGL and CQE layouts")

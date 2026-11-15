@@ -1,8 +1,7 @@
 import Foundation
 import Testing
-@testable import MockTarget
+@testable import NVMeMockTarget
 @testable import NVMeKit
-@testable import iSCSIKit
 
 /// The host side of a MemoryPipe speaking raw NVMe/TCP, for the rules the
 /// real initiator never breaks — the only way to show the mock refuses

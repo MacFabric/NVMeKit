@@ -1,5 +1,4 @@
 import Foundation
-import iSCSIKit
 
 /// A command's completion: the CQE and, for reads, the bytes the C2HData
 /// PDUs delivered.
@@ -109,11 +108,11 @@ public actor NVMeQueue {
     public private(set) var inCapsuleLimit: Int
 
     private var state: State = .idle
-    private var closeReason: ConnectionError?
+    private var closeReason: NVMeConnectionError?
     private var pending: [UInt16: PendingCommand] = [:]
     private var nextCID: UInt16 = 1
     private var slotWaiters: [Awaitable<Void>] = []
-    private var closeWaiters: [CheckedContinuation<ConnectionError, Never>] = []
+    private var closeWaiters: [CheckedContinuation<NVMeConnectionError, Never>] = []
     private var readLoop: Task<Void, Never>?
 
     public init(transport: any ConnectionTransport, queueID: UInt16, entries: UInt16,
@@ -140,7 +139,7 @@ public actor NVMeQueue {
     /// not implement.
     public func connect(host: NVMeHostIdentity, subsystemNQN: String, controllerID: UInt16,
                         keepAliveMS: UInt32) async throws -> (controllerID: UInt16, authRequired: Bool) {
-        guard state == .idle else { throw ConnectionError.protocolError("connect on a used queue") }
+        guard state == .idle else { throw NVMeConnectionError.protocolError("connect on a used queue") }
 
         var icreq = ICReqPDU()
         icreq.digests = requestDigests ? NVMeTCPDigests(header: true, data: true) : NVMeTCPDigests()
@@ -194,7 +193,7 @@ public actor NVMeQueue {
             do {
                 if let raw = try deframer.next() {
                     guard case .icResp(let resp) = try AnyNVMeTCPPDU.decode(raw) else {
-                        throw ConnectionError.protocolError("expected ICResp, got PDU type \(raw.type)")
+                        throw NVMeConnectionError.protocolError("expected ICResp, got PDU type \(raw.type)")
                     }
                     return resp
                 }
@@ -264,7 +263,7 @@ public actor NVMeQueue {
     }
 
     /// Await connection teardown (the controller's recovery trigger).
-    public func waitClosed() async -> ConnectionError {
+    public func waitClosed() async -> NVMeConnectionError {
         if state == .closed { return closeReason ?? .closed }
         return await withCheckedContinuation { c in
             closeWaiters.append(c)
@@ -287,13 +286,13 @@ public actor NVMeQueue {
 
     private func ensureOpen() throws {
         guard state == .connected else {
-            throw closeReason ?? ConnectionError.closed
+            throw closeReason ?? NVMeConnectionError.closed
         }
     }
 
     /// Close with `reason` and hand it back, so a failed step can `throw`
     /// the very error the connection now carries.
-    private func fail(_ reason: ConnectionError) async -> ConnectionError {
+    private func fail(_ reason: NVMeConnectionError) async -> NVMeConnectionError {
         await close(reason: reason)
         return reason
     }
@@ -348,7 +347,7 @@ public actor NVMeQueue {
             try await transport.send(bytes)
         } catch {
             await close(reason: .connectionLost("send failed: \(error)"))
-            throw closeReason ?? ConnectionError.closed
+            throw closeReason ?? NVMeConnectionError.closed
         }
     }
 
@@ -379,7 +378,7 @@ public actor NVMeQueue {
             // error is its own FES; everything else is an invalid header.
             let fes: NVMeTCPFatalErrorStatus = error == .headerDigestMismatch ? .headerDigestError : .invalidPDUHeader
             await terminate(fes: fes, fei: 0, reason: "\(error)")
-        } catch let error as ConnectionError {
+        } catch let error as NVMeConnectionError {
             await close(reason: error)
         } catch {
             await close(reason: .connectionLost("\(error)"))
@@ -411,7 +410,7 @@ public actor NVMeQueue {
         case .c2hTermReq(let term):
             // The controller already declared the error; answer with the
             // termination it asked for, not a termination request of our own.
-            throw ConnectionError.protocolError(
+            throw NVMeConnectionError.protocolError(
                 "controller terminated the connection: FES 0x\(String(term.fes.rawValue, radix: 16)) FEI \(term.fei)")
         case .icResp:
             throw fatal(.pduSequenceError, "ICResp after the connection was initialized")
@@ -445,7 +444,7 @@ public actor NVMeQueue {
             // The caller gets the error every other pending command gets when
             // the connection closes, so the controller recovers and retries
             // it; the private fatal error is for the read loop alone.
-            command.completion.complete(.failure(ConnectionError.protocolError(reason)))
+            command.completion.complete(.failure(NVMeConnectionError.protocolError(reason)))
             throw fatal(.pduSequenceError, reason)
         }
         command.completion.complete(.success(NVMeCompletion(cqe: cqe, data: command.readBuffer)))
@@ -515,7 +514,7 @@ public actor NVMeQueue {
         }
     }
 
-    private func close(reason: ConnectionError) async {
+    private func close(reason: NVMeConnectionError) async {
         guard state != .closed else { return }
         state = .closed
         closeReason = reason

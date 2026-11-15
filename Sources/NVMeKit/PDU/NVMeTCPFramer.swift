@@ -1,5 +1,4 @@
 import Foundation
-import iSCSIKit
 
 /// Serializes a PDU to wire bytes: CH + PSH [+ HDGST] + data [+ DDGST].
 ///

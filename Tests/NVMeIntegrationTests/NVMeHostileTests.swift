@@ -1,8 +1,7 @@
 import Foundation
 import Testing
-@testable import MockTarget
+@testable import NVMeMockTarget
 @testable import NVMeKit
-@testable import iSCSIKit
 
 /// A controller that breaks the protocol must produce an error, never bad
 /// data and never a hang — the `HostileTargetTests` twin.
@@ -18,7 +17,7 @@ struct NVMeHostileTests {
         let fleet = hostileFleet { $0.icrespPFV = 1 }
         let controller = NVMeController(config: testControllerConfig(),
                                         policy: testPolicy(recoveryAttempts: 1)) { await fleet.makeTransport() }
-        await #expect(throws: ConnectionError.self) { try await controller.activate() }
+        await #expect(throws: NVMeConnectionError.self) { try await controller.activate() }
         await fleet.shutdown()
     }
 
@@ -26,7 +25,7 @@ struct NVMeHostileTests {
         let fleet = hostileFleet { $0.icrespCPDA = 3 }
         let controller = NVMeController(config: testControllerConfig(),
                                         policy: testPolicy(recoveryAttempts: 1)) { await fleet.makeTransport() }
-        await #expect(throws: ConnectionError.self) { try await controller.activate() }
+        await #expect(throws: NVMeConnectionError.self) { try await controller.activate() }
         await fleet.shutdown()
     }
 
@@ -36,7 +35,7 @@ struct NVMeHostileTests {
         let fleet = NVMeFleet(config: config)
         let controller = NVMeController(config: testControllerConfig(),
                                         policy: testPolicy(recoveryAttempts: 1)) { await fleet.makeTransport() }
-        await #expect(throws: ConnectionError.self) { try await controller.activate() }
+        await #expect(throws: NVMeConnectionError.self) { try await controller.activate() }
         await fleet.shutdown()
     }
 
@@ -71,7 +70,7 @@ struct NVMeHostileTests {
         await #expect {
             _ = try await device.read(offset: 0, length: 4096)
         } throws: { error in
-            guard case ConnectionError.protocolError(let reason) = error else { return false }
+            guard case NVMeConnectionError.protocolError(let reason) = error else { return false }
             return reason.contains("FES 0x2")
         }
         await fleet.shutdown()
@@ -84,7 +83,7 @@ struct NVMeHostileTests {
         let controller = try await activatedController(
             fleet: fleet, policy: testPolicy(retries: 0, recoveryAttempts: 1))
         let device = NVMeBlockDevice(controller: controller, nsid: 1)
-        await #expect(throws: ConnectionError.self) {
+        await #expect(throws: NVMeConnectionError.self) {
             _ = try await device.read(offset: 0, length: 4096)
         }
         #expect(await eventually { await fleet.subsystem.h2cTermReqsReceived.count == 1 })
@@ -102,7 +101,7 @@ struct NVMeHostileTests {
         let controller = try await activatedController(
             fleet: fleet, policy: testPolicy(retries: 0, recoveryAttempts: 1))
         let device = NVMeBlockDevice(controller: controller, nsid: 1)
-        await #expect(throws: ConnectionError.self) {
+        await #expect(throws: NVMeConnectionError.self) {
             try await device.write(offset: 0, data: Data(count: 8192))
         }
         await fleet.shutdown()
@@ -113,7 +112,7 @@ struct NVMeHostileTests {
         let controller = try await activatedController(
             fleet: fleet, policy: testPolicy(retries: 0, recoveryAttempts: 1))
         let device = NVMeBlockDevice(controller: controller, nsid: 1)
-        await #expect(throws: ConnectionError.self) {
+        await #expect(throws: NVMeConnectionError.self) {
             _ = try await device.read(offset: 0, length: 4096)
         }
         await fleet.shutdown()
@@ -130,7 +129,7 @@ struct NVMeHostileTests {
         await #expect {
             _ = try await device.read(offset: 0, length: 4096)
         } throws: { error in
-            guard case ConnectionError.protocolError(let reason) = error else { return false }
+            guard case NVMeConnectionError.protocolError(let reason) = error else { return false }
             return reason.contains("C2HData outside the read buffer")
         }
         #expect(await eventually { await fleet.subsystem.h2cTermReqsReceived.count == 1 })
@@ -149,7 +148,7 @@ struct NVMeHostileTests {
         let controller = try await activatedController(
             fleet: fleet, policy: testPolicy(retries: 0, recoveryAttempts: 1))
         let device = NVMeBlockDevice(controller: controller, nsid: 1)
-        await #expect(throws: ConnectionError.self) {
+        await #expect(throws: NVMeConnectionError.self) {
             _ = try await device.read(offset: 0, length: 4096)
         }
         await fleet.shutdown()
@@ -160,7 +159,7 @@ struct NVMeHostileTests {
         let controller = try await activatedController(
             fleet: fleet, policy: testPolicy(retries: 0, recoveryAttempts: 1))
         let device = NVMeBlockDevice(controller: controller, nsid: 1)
-        await #expect(throws: ConnectionError.self) {
+        await #expect(throws: NVMeConnectionError.self) {
             _ = try await device.read(offset: 0, length: 4096)
         }
         await fleet.shutdown()
@@ -174,7 +173,7 @@ struct NVMeHostileTests {
         let controller = try await activatedController(
             fleet: fleet, policy: testPolicy(retries: 0, recoveryAttempts: 1))
         let device = NVMeBlockDevice(controller: controller, nsid: 1)
-        await #expect(throws: ConnectionError.self) {
+        await #expect(throws: NVMeConnectionError.self) {
             _ = try await device.read(offset: 0, length: 4096)
         }
         await fleet.shutdown()
@@ -188,7 +187,7 @@ struct NVMeHostileTests {
         let controller = try await activatedController(
             fleet: fleet, policy: testPolicy(retries: 0, recoveryAttempts: 1))
         let device = NVMeBlockDevice(controller: controller, nsid: 1)
-        await #expect(throws: ConnectionError.self) {
+        await #expect(throws: NVMeConnectionError.self) {
             try await device.write(offset: 0, data: Data(count: 4096))
         }
         await fleet.shutdown()

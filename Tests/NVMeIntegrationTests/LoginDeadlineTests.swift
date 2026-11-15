@@ -1,8 +1,7 @@
 import Foundation
 import Testing
-@testable import MockTarget
+@testable import NVMeMockTarget
 @testable import NVMeKit
-@testable import iSCSIKit
 
 /// A target that accepts the connection and then says nothing. `taskTimeout`
 /// covers I/O on an established connection only, so before
@@ -35,68 +34,6 @@ struct LoginDeadlineTests {
         var policy = testPolicy(retries: 1, recoveryAttempts: attempts)
         policy.loginTimeout = loginTimeout
         return policy
-    }
-
-    @Test func anISCSILoginNobodyAnswersTimesOutAndClosesTheConnection() async throws {
-        let silent = SilentPeers()
-        let session = ISCSISession(login: standardLogin(), policy: policy()) {
-            await silent.makeTransport()
-        }
-        await #expect(throws: DeadlineError.timedOut) { try await session.activate() }
-        #expect(try await silent.allClosed())
-    }
-
-    @Test func recoveryIntoASilentTargetExhaustsInsteadOfHanging() async throws {
-        // The first connection is healthy; after it drops, every portal the
-        // session can reach accepts TCP and never answers the login.
-        actor Script {
-            let fleet = TargetFleet(disk: RAMDisk(), configs: [MockTargetConfig()])
-            let silent = SilentPeers()
-            var calls = 0
-            func makeTransport() async -> any ConnectionTransport {
-                calls += 1
-                return calls == 1 ? await fleet.makeTransport() : await silent.makeTransport()
-            }
-        }
-        let script = Script()
-        let session = ISCSISession(login: standardLogin(), policy: policy(attempts: 2)) {
-            await script.makeTransport()
-        }
-        try await session.activate()
-        await script.fleet.shutdown()
-
-        await #expect(throws: SessionError.self) {
-            _ = try await session.execute(SCSITask(lun: 0, cdb: CDB.testUnitReady()))
-        }
-        #expect(await script.calls == 3)   // the healthy login, then both attempts
-        #expect(try await script.silent.allClosed())
-    }
-
-    @Test func sendTargetsAgainstASilentPortalTimesOut() async throws {
-        let silent = SilentPeers()
-        await #expect(throws: DeadlineError.timedOut) {
-            _ = try await Discovery.sendTargets(
-                transport: await silent.makeTransport(),
-                initiatorName: "iqn.2026-08.com.example:initiator",
-                timeout: .milliseconds(200))
-        }
-        #expect(try await silent.allClosed())
-    }
-
-    @Test func aLogoutTheTargetIgnoresStillFinishes() async throws {
-        var config = MockTargetConfig()
-        config.faults.swallowLogout = true
-        let fleet = TargetFleet(disk: RAMDisk(), configs: [config])
-        var policy = policy()
-        policy.logoutTimeout = .milliseconds(200)
-        let session = ISCSISession(login: standardLogin(), policy: policy) {
-            await fleet.makeTransport()
-        }
-        try await session.activate()
-        let started = ContinuousClock.now
-        try await session.logout()
-        #expect(ContinuousClock.now - started < .seconds(2))
-        await fleet.shutdown()
     }
 
     @Test func anNVMeControllerThatNeverSendsICRespTimesOut() async throws {

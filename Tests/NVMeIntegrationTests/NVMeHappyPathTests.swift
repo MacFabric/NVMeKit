@@ -1,8 +1,7 @@
 import Foundation
 import Testing
-@testable import MockTarget
+@testable import NVMeMockTarget
 @testable import NVMeKit
-@testable import iSCSIKit
 
 @Suite("Integration: NVMe/TCP happy paths", .timeLimit(.minutes(1)))
 struct NVMeHappyPathTests {

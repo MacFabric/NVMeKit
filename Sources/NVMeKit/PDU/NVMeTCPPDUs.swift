@@ -1,5 +1,4 @@
 import Foundation
-import iSCSIKit
 
 /// One concrete PDU type. `encode()` produces the PSH and data; digests,
 /// PDO and PLEN are the serializer's job. Layouts follow NVMe/TCP 1.0 §3.6.

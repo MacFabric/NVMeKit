@@ -1,6 +1,5 @@
 import Foundation
 import Testing
-import iSCSIKit
 @testable import NVMeKit
 
 @Suite("Admin, Fabrics and NVM command builders")

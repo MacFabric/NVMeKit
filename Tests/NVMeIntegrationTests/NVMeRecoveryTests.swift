@@ -1,8 +1,7 @@
 import Foundation
 import Testing
-@testable import MockTarget
+@testable import NVMeMockTarget
 @testable import NVMeKit
-@testable import iSCSIKit
 
 /// Connection loss on either queue destroys the controller and the next
 /// command rebuilds a fresh admin + I/O pair — the `SessionRecoveryTests`

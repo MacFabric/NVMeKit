@@ -1,5 +1,4 @@
 import Foundation
-import iSCSIKit
 
 /// Who we are and what we are attaching to.
 public struct NVMeControllerConfig: Sendable {
@@ -166,7 +165,7 @@ public actor NVMeController {
                 return try await withDeadline(policy.taskTimeout) {
                     try await queue.submitChecked(sqe, data: data, expectedRead: expectedRead)
                 }
-            } catch let error as ConnectionError {
+            } catch let error as NVMeConnectionError {
                 try Task.checkCancellation()
                 guard !loggedOut, attempt < policy.taskRetries else { throw error }
                 attempt += 1
@@ -272,7 +271,7 @@ public actor NVMeController {
             let cap = ControllerCapabilities(raw: try await queue.submitChecked(
                 NVMeCommands.propertyGet(commandID: 0, offset: NVMeProperty.cap, wide: true)).cqe.result64)
             guard cap.supportsNVMCommandSet else {
-                throw ConnectionError.protocolError("controller does not support the NVM command set")
+                throw NVMeConnectionError.protocolError("controller does not support the NVM command set")
             }
             _ = try await queue.submitChecked(NVMeCommands.propertySet(
                 commandID: 0, offset: NVMeProperty.cc, value: NVMeCommands.controllerConfigurationEnable))
@@ -375,7 +374,7 @@ public actor NVMeController {
     /// none. If neither queue is it any more, someone else's recovery already
     /// replaced the pair, and the caller just retries: tearing down the
     /// current pair would reset a healthy controller for a late failure.
-    private func recover(after error: ConnectionError?, on failed: NVMeQueue?) async throws {
+    private func recover(after error: NVMeConnectionError?, on failed: NVMeQueue?) async throws {
         if let recoveryFailed { throw recoveryFailed }
         if loggedOut { throw SessionError.loggedOut }
         if let existing = recoveryTask {

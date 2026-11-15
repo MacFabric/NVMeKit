@@ -1,5 +1,4 @@
 import Foundation
-import iSCSIKit
 
 /// NVMe/TCP PDU types (NVMe/TCP Transport Specification §3.3).
 public enum NVMeTCPPDUType: UInt8, Sendable, CaseIterable {
