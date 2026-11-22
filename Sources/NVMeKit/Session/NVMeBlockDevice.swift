@@ -118,6 +118,9 @@ public actor NVMeBlockDevice: BlockDeviceBackend {
         try validate(offset: offset, length: data.count, blockSize: bs, capacity: count)
         let blocksPerChunk = max(1, await maxTransferBytes() / bs)
 
+        // Ranges, not payloads: each chunk is a slice of the caller's buffer
+        // all the way to the transport, so splitting a request copies none
+        // of it.
         var plan: [(lba: UInt64, bytes: Range<Data.Index>)] = []
         var lba = offset / UInt64(bs)
         var cursor = data.startIndex
@@ -132,7 +135,7 @@ public actor NVMeBlockDevice: BlockDeviceBackend {
         }
 
         if plan.count == 1 {
-            try await writeChunk(lba: plan[0].lba, payload: Data(data[plan[0].bytes]), blockSize: bs)
+            try await writeChunk(lba: plan[0].lba, payload: data[plan[0].bytes], blockSize: bs)
             return
         }
 
@@ -142,7 +145,7 @@ public actor NVMeBlockDevice: BlockDeviceBackend {
                 let chunk = plan[next]
                 next += 1
                 group.addTask { [self] in
-                    try await writeChunk(lba: chunk.lba, payload: Data(data[chunk.bytes]), blockSize: bs)
+                    try await writeChunk(lba: chunk.lba, payload: data[chunk.bytes], blockSize: bs)
                 }
             }
             while next < min(Self.maxChunksInFlight, plan.count) { addNext() }

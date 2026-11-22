@@ -144,7 +144,7 @@ public actor NVMeQueue {
         var icreq = ICReqPDU()
         icreq.digests = requestDigests ? NVMeTCPDigests(header: true, data: true) : NVMeTCPDigests()
         icreq.maxR2T = 0
-        try await sendRaw(serializer.serialize(icreq.encode()))
+        try await sendRaw(serializer.serializeParts(icreq.encode()))
         let icresp = try await receiveICResp()
         guard icresp.pfv == 0 else {
             throw await fail(.protocolError("controller wants PDU format version \(icresp.pfv), only 0 is supported"))
@@ -253,7 +253,7 @@ public actor NVMeQueue {
         pending[cid] = command
 
         let capsule = CapsuleCmdPDU(sqe: sqe.bytes, inCapsuleData: inCapsule ? data : Data())
-        try await sendRaw(serializer.serialize(capsule.encode()))
+        try await sendRaw(serializer.serializeParts(capsule.encode()))
 
         return try await withTaskCancellationHandler {
             try await suspend(command.completion)
@@ -342,9 +342,39 @@ public actor NVMeQueue {
         command.completion.complete(.failure(CancellationError()))
     }
 
-    private func sendRaw(_ bytes: Data) async throws {
+    /// The R2T answer most recently queued. Each waits for the one before,
+    /// so H2CData leaves in the order the controller asked for it; command
+    /// capsules do not queue here, since the transport keeps each send whole
+    /// and nothing orders one command against another.
+    private var lastDataSend: Task<Void, Never>?
+
+    /// Queue `parts` and return without waiting for the transport to take
+    /// them. For H2CData answering an R2T, which the read loop sends:
+    /// waiting there stopped the loop receiving for as long as the send
+    /// took, and against a full send buffer that is as long as the network
+    /// takes to drain it — no C2HData and no completion for any other
+    /// command meanwhile.
+    ///
+    /// Nothing is lost by not waiting. The bytes are slices of a buffer the
+    /// command already holds, so no memory is added; a send that fails closes
+    /// the connection exactly as an awaited one does; and one that never
+    /// completes is ended, as before, by whoever closes the connection.
+    private func sendWithoutWaiting(_ parts: [Data]) {
+        let previous = lastDataSend
+        let transport = self.transport
+        lastDataSend = Task { [weak self] in
+            await previous?.value
+            do {
+                try await transport.send(contentsOf: parts)
+            } catch {
+                await self?.close(reason: .connectionLost("send failed: \(error)"))
+            }
+        }
+    }
+
+    private func sendRaw(_ parts: [Data]) async throws {
         do {
-            try await transport.send(bytes)
+            try await transport.send(contentsOf: parts)
         } catch {
             await close(reason: .connectionLost("send failed: \(error)"))
             throw closeReason ?? NVMeConnectionError.closed
@@ -406,7 +436,7 @@ public actor NVMeQueue {
         case .c2hData(let pdu):
             try handleC2HData(pdu, dataDigestFailed: raw.dataDigestFailed)
         case .r2t(let r2t):
-            try await handleR2T(r2t)
+            try handleR2T(r2t)
         case .c2hTermReq(let term):
             // The controller already declared the error; answer with the
             // termination it asked for, not a termination request of our own.
@@ -486,7 +516,7 @@ public actor NVMeQueue {
     /// Answer an R2T with H2CData PDUs, each at most MAXH2CDATA, LAST_PDU on
     /// the final one for this R2T. A cancelled command still answers: the
     /// controller must collect the solicited data before it can complete.
-    private func handleR2T(_ r2t: NVMeR2TPDU) async throws {
+    private func handleR2T(_ r2t: NVMeR2TPDU) throws {
         guard let command = pending[r2t.cccid] else {
             throw fatal(.invalidPDUHeader, fei: FieldOffset.cccid, "R2T for unknown CID \(r2t.cccid)")
         }
@@ -501,17 +531,21 @@ public actor NVMeQueue {
                 "R2T requests bytes beyond the write buffer (offset \(start), \(length) of \(command.writeData.count))")
         }
         command.solicitedBytes = start + length
+        // Built whole, as slices of the command's buffer, and queued as one
+        // send that is not waited for; see `sendWithoutWaiting`.
         let chunk = max(1, Int(maxH2CData))
+        var wire: [Data] = []
         var offset = start
         let end = start + length
         while offset < end {
             let next = min(offset + chunk, end)
             let pdu = H2CDataPDU(cccid: r2t.cccid, ttag: r2t.ttag, dataOffset: UInt32(offset),
-                                 data: Data(command.writeData.sub(offset, next - offset)),
+                                 data: command.writeData.sub(offset, next - offset),
                                  last: next == end)
-            try await sendRaw(serializer.serialize(pdu.encode()))
+            wire += serializer.serializeParts(pdu.encode())
             offset = next
         }
+        sendWithoutWaiting(wire)
     }
 
     private func close(reason: NVMeConnectionError) async {
