@@ -8,6 +8,13 @@ public struct NVMeControllerConfig: Sendable {
     public var requestDigests = true
     /// I/O queue depth to ask for, clamped to CAP.MQES.
     public var ioQueueEntries: UInt16 = 128
+    /// I/O queues to ask for, each a TCP connection of its own with its own
+    /// receive loop. The controller grants what it will (Set Features,
+    /// Number of Queues) and the fewer of the two is opened. One, the
+    /// default, is what this initiator always had; more spread commands over
+    /// several connections, which is where small-block throughput is bounded
+    /// by one connection's receive loop and not by the link.
+    public var ioQueueCount = 1
     public var adminQueueEntries: UInt16 = 32
     /// KATO for the admin Connect, in ms. nil derives twice the keepalive
     /// interval from the session policy (0, i.e. no timer, when the policy
@@ -42,7 +49,10 @@ public actor NVMeController {
     private let policy: SessionPolicy
 
     private var admin: NVMeQueue?
-    private var io: NVMeQueue?
+    /// The I/O queues, QID 1 upward. Empty while there is no controller.
+    private var ioQueues: [NVMeQueue] = []
+    /// Which of them takes the next command: each in turn.
+    private var nextIOQueue = 0
     private var controllerID: UInt16 = 0
     private var capabilities: ControllerCapabilities?
     public private(set) var identity: IdentifyController?
@@ -80,7 +90,11 @@ public actor NVMeController {
     public var volatileWriteCachePresent: Bool? { identity?.volatileWriteCachePresent }
 
     /// SQ entries the live I/O queue was connected with; nil when down.
-    public var ioQueueEntries: UInt16? { io?.entries }
+    public var ioQueueEntries: UInt16? { ioQueues.first?.entries }
+
+    /// I/O queues open right now: the fewer of what the configuration asked
+    /// for and what the controller granted.
+    public var ioQueueCount: Int { ioQueues.count }
 
     /// MDTS in bytes; nil when the controller sets no limit.
     public var maxTransferBytes: Int? {
@@ -104,7 +118,7 @@ public actor NVMeController {
     public func activate() async throws {
         loggedOut = false
         recoveryFailed = nil
-        guard io == nil else { return }
+        guard ioQueues.isEmpty else { return }
         try await establish()
     }
 
@@ -239,8 +253,9 @@ public actor NVMeController {
         if let capabilities {
             out["MQES"] = String(capabilities.maxQueueEntries)
         }
-        if let io {
-            out["IOQueueEntries"] = String(io.entries)
+        if let first = ioQueues.first {
+            out["IOQueueEntries"] = String(first.entries)
+            out["IOQueues"] = String(ioQueues.count)
         }
         return out
     }
@@ -250,10 +265,21 @@ public actor NVMeController {
     private func ensureActive(_ kind: QueueKind) async throws -> NVMeQueue {
         if loggedOut { throw SessionError.loggedOut }
         if let recoveryFailed { throw recoveryFailed }
-        if let queue = (kind == .admin ? admin : io) { return queue }
+        if let queue = queue(kind) { return queue }
         try await recover(after: nil, on: nil)
-        guard let queue = (kind == .admin ? admin : io) else { throw SessionError.notActive }
+        guard let queue = queue(kind) else { throw SessionError.notActive }
         return queue
+    }
+
+    /// The queue a command of this kind goes to now. I/O commands take the
+    /// I/O queues in turn: nothing orders one command against another, and
+    /// the commands a large request is split into are issued together, so
+    /// they land one per queue.
+    private func queue(_ kind: QueueKind) -> NVMeQueue? {
+        if kind == .admin { return admin }
+        guard !ioQueues.isEmpty else { return nil }
+        nextIOQueue = (nextIOQueue + 1) % ioQueues.count
+        return ioQueues[nextIOQueue]
     }
 
     /// Admin queue up and the controller enabled — shared with discovery,
@@ -312,14 +338,18 @@ public actor NVMeController {
             capabilities = cap
             digests = await adminQueue.digests
 
-            let id = try await withDeadline(policy.loginTimeout, onTimeout: { await adminQueue.close() }) {
+            let wanted = max(1, min(config.ioQueueCount, Self.maxIOQueues))
+            let (id, granted) = try await withDeadline(policy.loginTimeout, onTimeout: { await adminQueue.close() }) {
                 let id = try IdentifyController(data: try await adminQueue.submitChecked(
                     NVMeCommands.identify(commandID: 0, cns: IdentifyCNS.controller),
                     expectedRead: IdentifyController.size).data)
-                // One I/O submission queue and one completion queue (0's based).
-                _ = try await adminQueue.submitChecked(NVMeCommands.setFeatures(
-                    commandID: 0, featureID: NVMeFeature.numberOfQueues, dword11: 0))
-                return id
+                // Submission and completion queues wanted, 0's based, in the
+                // low and high halves; the answer is what was allocated, in
+                // the same form, and may be more or fewer than asked.
+                let allocated = try await adminQueue.submitChecked(NVMeCommands.setFeatures(
+                    commandID: 0, featureID: NVMeFeature.numberOfQueues,
+                    dword11: UInt32(wanted - 1) | UInt32(wanted - 1) << 16)).cqe.dw0
+                return (id, Int(min(allocated & 0xFFFF, allocated >> 16)) + 1)
             }
             identity = id
 
@@ -329,51 +359,62 @@ public actor NVMeController {
             if id.maxOutstandingCommands > 0 {
                 entries = min(entries, UInt16(clamping: id.maxOutstandingCommands))
             }
-            let ioQueue = NVMeQueue(
-                transport: try await makeTransport(), queueID: 1, entries: max(entries, 2),
-                requestDigests: config.requestDigests, maxPDUBytes: Self.ioPDULimit)
+            var opened: [NVMeQueue] = []
             do {
-                let host = config.host, subsystemNQN = config.subsystemNQN
-                _ = try await withDeadline(policy.loginTimeout, onTimeout: { await ioQueue.close() }) {
-                    try await ioQueue.connect(host: host, subsystemNQN: subsystemNQN,
-                                              controllerID: cntlid, keepAliveMS: 0)
+                for qid in 1 ... min(wanted, granted) {
+                    let ioQueue = NVMeQueue(
+                        transport: try await makeTransport(), queueID: UInt16(qid), entries: max(entries, 2),
+                        requestDigests: config.requestDigests, maxPDUBytes: Self.ioPDULimit)
+                    opened.append(ioQueue)
+                    let host = config.host, subsystemNQN = config.subsystemNQN
+                    _ = try await withDeadline(policy.loginTimeout, onTimeout: { await ioQueue.close() }) {
+                        try await ioQueue.connect(host: host, subsystemNQN: subsystemNQN,
+                                                  controllerID: cntlid, keepAliveMS: 0)
+                    }
+                    // In-capsule data is addressed from ICDOFF, which this
+                    // initiator only supports at 0 (nvmet's value); anything
+                    // else means every write is solicited instead.
+                    await ioQueue.setInCapsuleLimit(id.inCapsuleDataOffsetBytes == 0 ? id.inCapsuleDataBytes : 0)
                 }
-                // In-capsule data is addressed from ICDOFF, which this
-                // initiator only supports at 0 (nvmet's value); anything
-                // else means every write is solicited instead.
-                await ioQueue.setInCapsuleLimit(id.inCapsuleDataOffsetBytes == 0 ? id.inCapsuleDataBytes : 0)
+                // Logged out while this bring-up was under way: queues
+                // installed now would have nobody to take them down.
+                guard !loggedOut else { throw SessionError.loggedOut }
             } catch {
-                await ioQueue.close()
+                for queue in opened { await queue.close() }
                 throw error
             }
-            // Logged out while this bring-up was under way: a pair installed
-            // now would have nobody to take it down.
-            guard !loggedOut else {
-                await ioQueue.close()
-                throw SessionError.loggedOut
-            }
             admin = adminQueue
-            io = ioQueue
+            ioQueues = opened
+            nextIOQueue = 0
             startKeepalive(on: adminQueue)
             watchForClose(of: adminQueue)
-            watchForClose(of: ioQueue)
+            for queue in opened { watchForClose(of: queue) }
         } catch {
             await adminQueue.close()
             throw error
         }
     }
 
-    /// Tear both queues down without rebuilding. The next `ensureActive`
+    /// The most I/O queues this initiator opens, whatever is asked for: a
+    /// connection and a receive loop each, and nothing here gains from more
+    /// of them than there are cores to run the loops.
+    public static let maxIOQueues = 16
+
+    /// Tear every queue down without rebuilding. The next `ensureActive`
     /// starts fresh, so a wedge is not inherited by whoever comes next.
     private func dropQueues() async {
         keepaliveTask?.cancel()
         keepaliveTask = nil
         let oldAdmin = admin
-        let oldIO = io
+        let oldIO = ioQueues
         admin = nil
-        io = nil
-        await oldIO?.close()
+        ioQueues = []
+        for queue in oldIO { await queue.close() }
         await oldAdmin?.close()
+    }
+
+    private func isCurrent(_ queue: NVMeQueue) -> Bool {
+        queue === admin || ioQueues.contains { $0 === queue }
     }
 
     /// Recovery: tear the pair down, back off, bring a fresh pair up.
@@ -390,7 +431,7 @@ public actor NVMeController {
             try await existing.value
             return
         }
-        if let failed, failed !== admin, failed !== io, admin != nil || io != nil { return }
+        if let failed, !isCurrent(failed), admin != nil || !ioQueues.isEmpty { return }
         // `recoveryTask` MUST be assigned before the first suspension point.
         // Actor isolation does not span an `await`: with the teardown out here,
         // a second caller reaching the guard while this one was inside
@@ -479,7 +520,7 @@ public actor NVMeController {
     /// admin connection goes, and an I/O queue cannot outlive its admin
     /// queue's identity in any way this initiator wants to reason about.
     private func noteClosed(_ closed: NVMeQueue) async {
-        guard closed === admin || closed === io else { return }
+        guard isCurrent(closed) else { return }
         await dropQueues()
     }
 }

@@ -43,6 +43,10 @@ public struct MockNVMeConfig: Sendable {
     public var maxQueueEntries: UInt16 = 128
     /// MAXCMD in Identify Controller; 0 mirrors `maxQueueEntries`, as nvmet does.
     public var maxOutstandingCommands: UInt16 = 0
+    /// Most I/O queues a controller is allowed (nvmet's `max_qid`). Set
+    /// Features (Number of Queues) answers with this whatever the host asked
+    /// for, as nvmet does, and a Connect for a QID beyond it is refused.
+    public var maxIOQueues: UInt16 = 8
     /// Entries for the discovery log page served to the discovery NQN.
     public var discoveryEntries: [(subnqn: String, traddr: String, trsvcid: String)] = []
     /// Subsystems among `discoveryEntries` whose entry says TLS is required
@@ -141,6 +145,8 @@ public actor MockNVMeSubsystem {
     public private(set) var protocolViolations: [String] = []
     /// Most commands outstanding at once on any queue with this QID.
     public private(set) var peakOutstanding: [UInt16: Int] = [:]
+    /// Commands submitted on each QID, across every controller.
+    public private(set) var commandsSeen: [UInt16: Int] = [:]
     /// Size of every batch `interleaveReads` answered.
     public private(set) var interleavedReadBatches: [Int] = []
 
@@ -205,10 +211,27 @@ public actor MockNVMeSubsystem {
               state.subsystemNQN == subsystemNQN, !state.isDiscovery else {
             return .invalidParameter(attribute: Self.connectDataCNTLID)
         }
+        // IATTR 0, IPO 42: the QID field of the Connect command itself.
+        guard qid >= 1, qid <= max(config.maxIOQueues, 1) else { return .invalidParameter(attribute: 42) }
         guard state.queues.insert(qid).inserted else { return .commandSequenceError }
         controllers[controllerID] = state
         return .accepted(controllerID)
     }
+
+    /// Set Features, Number of Queues: what nvmet answers, which is its
+    /// maximum in both halves (0's based) and not what was asked for.
+    var numberOfQueuesResult: UInt32 {
+        let zeroBased = UInt32(max(config.maxIOQueues, 1)) - 1
+        return zeroBased | zeroBased << 16
+    }
+
+    /// I/O queues a controller has connected right now.
+    public func connectedIOQueues(controllerID: UInt16) -> Int {
+        controllers[controllerID]?.queues.filter { $0 != 0 }.count ?? 0
+    }
+
+    /// Controllers with a live admin queue.
+    public var controllerIDs: [UInt16] { controllers.keys.sorted() }
 
     func queueClosed(controllerID: UInt16, qid: UInt16) {
         guard var state = controllers[controllerID] else { return }
@@ -243,6 +266,7 @@ public actor MockNVMeSubsystem {
     func noteViolation(_ what: String) { protocolViolations.append(what) }
     func noteInterleavedBatch(_ size: Int) { interleavedReadBatches.append(size) }
     func noteOutstanding(qid: UInt16, _ count: Int) {
+        commandsSeen[qid, default: 0] += 1
         peakOutstanding[qid] = max(peakOutstanding[qid] ?? 0, count)
     }
 }
@@ -775,8 +799,12 @@ actor MockNVMeQueue {
                 try await respond(cid: cid, status: status)
                 return
             }
-            // Number of Queues answers with the allocation (0's based): one each.
-            try await respond(cid: cid, dw0: 0)
+            guard sqe.cdw10 & 0xFF == UInt32(NVMeFeature.numberOfQueues) else {
+                try await respond(cid: cid, dw0: 0)
+                return
+            }
+            // Number of Queues answers with the allocation (0's based).
+            try await respond(cid: cid, dw0: await subsystem.numberOfQueuesResult)
         case NVMeOpcode.Admin.keepAlive:
             if faults.swallowNops { return }
             if let status = await dataSGLStatus(sqe, expected: 0, inCapsule: Data(), isWrite: false) {
