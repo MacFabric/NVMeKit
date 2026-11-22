@@ -148,8 +148,11 @@ public actor NVMeController {
     /// retrying in place on a Transient Transport Error — a data digest
     /// failure, which costs the command and not the connection. Both bounded
     /// by policy. Block I/O is idempotent, so the retry is safe.
-    public func execute(_ sqe: SQE, data: Data = Data(), expectedRead: Int = 0) async throws -> NVMeCompletion {
-        try await execute(on: .io, sqe, data: data, expectedRead: expectedRead)
+    ///
+    /// `readInto`: where the data is to be received; see `NVMeQueue.submit`.
+    public func execute(_ sqe: SQE, data: Data = Data(), expectedRead: Int = 0,
+                        readInto: ReadBuffer.Region? = nil) async throws -> NVMeCompletion {
+        try await execute(on: .io, sqe, data: data, expectedRead: expectedRead, readInto: readInto)
     }
 
     /// The same for admin commands.
@@ -157,13 +160,14 @@ public actor NVMeController {
         try await execute(on: .admin, sqe, data: Data(), expectedRead: expectedRead)
     }
 
-    private func execute(on kind: QueueKind, _ sqe: SQE, data: Data, expectedRead: Int) async throws -> NVMeCompletion {
+    private func execute(on kind: QueueKind, _ sqe: SQE, data: Data, expectedRead: Int,
+                         readInto: ReadBuffer.Region? = nil) async throws -> NVMeCompletion {
         var attempt = 0
         while true {
             let queue = try await ensureActive(kind)
             do {
                 return try await withDeadline(policy.taskTimeout) {
-                    try await queue.submitChecked(sqe, data: data, expectedRead: expectedRead)
+                    try await queue.submitChecked(sqe, data: data, expectedRead: expectedRead, readInto: readInto)
                 }
             } catch let error as NVMeConnectionError {
                 try Task.checkCancellation()
@@ -181,6 +185,11 @@ public actor NVMeController {
                 attempt += 1
             } catch is DeadlineError {
                 try Task.checkCancellation()
+                // The command is still outstanding on that queue, which may
+                // yet receive data for it. Closed first, and waited for: a
+                // retry reads into the same buffer, and nothing may still be
+                // writing there. Recovery would close it anyway.
+                await queue.close()
                 // No usable Abort on NVMe-oF: drop the pair rather than let a
                 // wedge be inherited, and rebuild on the next attempt.
                 guard !loggedOut, attempt < policy.taskRetries else {

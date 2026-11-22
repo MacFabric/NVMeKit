@@ -7,30 +7,38 @@ import Foundation
 /// relative to `startIndex`, so these work uniformly on slices handed out by
 /// the deframer.
 extension Data {
-    package func leU16(_ offset: Int) -> UInt16 {
-        UInt16(u8(offset)) | UInt16(u8(offset + 1)) << 8
+    /// Trap, as a subscript would, before a raw load or store can touch
+    /// bytes outside this buffer: the unsafe accessors check their offsets
+    /// only in debug builds, and these fields come off the network.
+    @inline(__always)
+    private func checkRange(_ offset: Int, _ width: Int) {
+        precondition(offset >= 0 && width <= count && offset <= count - width,
+                     "field outside the buffer")
     }
 
-    package func leU32(_ offset: Int) -> UInt32 {
-        UInt32(leU16(offset)) | UInt32(leU16(offset + 2)) << 16
+    /// One load of the whole field, where a byte at a time through the
+    /// subscript cost a bounds check and an access per byte.
+    @inline(__always)
+    private func loadLE<T: FixedWidthInteger>(_ offset: Int, as type: T.Type) -> T {
+        checkRange(offset, MemoryLayout<T>.size)
+        return withUnsafeBytes { T(littleEndian: $0.loadUnaligned(fromByteOffset: offset, as: T.self)) }
     }
 
-    package func leU64(_ offset: Int) -> UInt64 {
-        UInt64(leU32(offset)) | UInt64(leU32(offset + 4)) << 32
+    @inline(__always)
+    private mutating func storeLE<T: FixedWidthInteger>(_ value: T, _ offset: Int) {
+        checkRange(offset, MemoryLayout<T>.size)
+        withUnsafeMutableBytes { $0.storeBytes(of: value.littleEndian, toByteOffset: offset, as: T.self) }
     }
 
-    package mutating func setLE16(_ v: UInt16, _ offset: Int) {
-        setU8(UInt8(v & 0xFF), offset)
-        setU8(UInt8(v >> 8), offset + 1)
-    }
+    package func leU16(_ offset: Int) -> UInt16 { loadLE(offset, as: UInt16.self) }
 
-    package mutating func setLE32(_ v: UInt32, _ offset: Int) {
-        setLE16(UInt16(v & 0xFFFF), offset)
-        setLE16(UInt16(v >> 16), offset + 2)
-    }
+    package func leU32(_ offset: Int) -> UInt32 { loadLE(offset, as: UInt32.self) }
 
-    package mutating func setLE64(_ v: UInt64, _ offset: Int) {
-        setLE32(UInt32(v & 0xFFFF_FFFF), offset)
-        setLE32(UInt32(v >> 32), offset + 4)
-    }
+    package func leU64(_ offset: Int) -> UInt64 { loadLE(offset, as: UInt64.self) }
+
+    package mutating func setLE16(_ v: UInt16, _ offset: Int) { storeLE(v, offset) }
+
+    package mutating func setLE32(_ v: UInt32, _ offset: Int) { storeLE(v, offset) }
+
+    package mutating func setLE64(_ v: UInt64, _ offset: Int) { storeLE(v, offset) }
 }
