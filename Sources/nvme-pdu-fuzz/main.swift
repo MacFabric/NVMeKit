@@ -31,11 +31,63 @@ private func nvmeStateless(_ data: Data) {
     for digests in [NVMeTCPDigests(), NVMeTCPDigests(header: true, data: true)] {
         var deframer = NVMeTCPDeframer(digests: digests, maxPDUBytes: 1 << 20)
         deframer.append(data)
+        var whole: [RawNVMeTCPPDU] = []
         while let raw = try? deframer.next() {
+            whole.append(raw)
             if let pdu = try? AnyNVMeTCPPDU.decode(raw) {
                 _ = pdu.encode()
             }
         }
+        _ = deframer.lastHeader
+        // The same bytes taken in steps, fed in two pieces cut wherever the
+        // input's first byte says: the read loop's path. It must not crash,
+        // and must find the PDUs `next()` found, in order, until the first
+        // one either of them refuses.
+        var steps = NVMeTCPDeframer(digests: digests, maxPDUBytes: 1 << 20)
+        let cut = data.isEmpty ? 0 : Int(data[data.startIndex]) % (data.count + 1)
+        var stepped: [RawNVMeTCPPDU] = []
+        var head: NVMeTCPDeframer.Head?
+        var body = Data()
+        var piece = [UInt8](repeating: 0, count: 61)
+        var failed = false
+        for part in [data.prefix(cut), data.dropFirst(cut)] where !failed {
+            steps.append(part)
+            pump: while true {
+                do {
+                    if head == nil {
+                        guard let next = try steps.nextHead() else { break pump }
+                        head = next
+                        body = Data()
+                    }
+                    guard let current = head else { break pump }
+                    var digestFailed = false
+                    if current.dataLength % 2 == 0 {
+                        guard let taken = steps.takeData() else { break pump }
+                        body = taken.data
+                        digestFailed = taken.digestFailed
+                    } else {
+                        while steps.dataRemaining > 0 {
+                            let moved = piece.withUnsafeMutableBytes { steps.readData(into: $0) }
+                            if moved == 0 { break pump }
+                            body.append(contentsOf: piece[0 ..< moved])
+                        }
+                        let end = steps.finishData()
+                        if end == .needMore { break pump }
+                        digestFailed = end == .digestFailed
+                    }
+                    var raw = RawNVMeTCPPDU(rawType: current.type, flags: current.flags, psh: current.psh, data: body)
+                    raw.dataDigestFailed = digestFailed
+                    stepped.append(raw)
+                    head = nil
+                } catch {
+                    failed = true
+                    break pump
+                }
+            }
+            _ = steps.lastHeader
+        }
+        precondition(stepped.count >= whole.count && Array(stepped.prefix(whole.count)) == whole,
+                     "deframing in steps disagrees with next()")
     }
     _ = try? IdentifyController(data: data)
     // The parse alone never reached the trap this harness missed: MDTS turned
