@@ -13,7 +13,20 @@ public struct NVMeTCPSerializer: Sendable {
         self.digests = digests
     }
 
+    /// The same bytes as one buffer, which costs a copy of the data.
     public func serialize(_ raw: RawNVMeTCPPDU) -> Data {
+        let parts = serializeParts(raw)
+        if parts.count == 1 { return parts[0] }
+        var out = Data(capacity: parts.reduce(0) { $0 + $1.count })
+        for part in parts { out.append(part) }
+        return out
+    }
+
+    /// The PDU's wire bytes as up to three buffers, in order: the header
+    /// (CH, PSH and HDGST), the data exactly as the caller holds it, and the
+    /// DDGST. Sent with `ConnectionTransport.send(contentsOf:)`, write data
+    /// reaches the socket without first being copied in behind its header.
+    public func serializeParts(_ raw: RawNVMeTCPPDU) -> [Data] {
         let hlen = raw.hlen
         if Self.isTerminationRequest(raw.type) {
             // §3.6.2.4/5: FLAGS and PDO reserved, never a digest, the
@@ -24,7 +37,7 @@ public struct NVMeTCPSerializer: Sendable {
                                      plen: UInt32(hlen + data.count)).encoded)
             out.append(raw.psh)
             out.append(data)
-            return out
+            return [out]
         }
         let hdgst = digests.header ? 4 : 0
         let hasData = !raw.data.isEmpty
@@ -35,18 +48,15 @@ public struct NVMeTCPSerializer: Sendable {
         let pdo = hasData ? hlen + hdgst : 0
         let plen = hlen + hdgst + raw.data.count + ddgst
 
-        var out = Data(capacity: plen)
-        out.append(NVMeTCPHeader(type: raw.type, flags: flags, hlen: UInt8(hlen),
-                                 pdo: UInt8(pdo), plen: UInt32(plen)).encoded)
-        out.append(raw.psh)
+        var head = Data(capacity: hlen + hdgst)
+        head.append(NVMeTCPHeader(type: raw.type, flags: flags, hlen: UInt8(hlen),
+                                  pdo: UInt8(pdo), plen: UInt32(plen)).encoded)
+        head.append(raw.psh)
         // HDGST covers CH + PSH only.
-        if hdgst > 0 { out.append(CRC32C.wireDigest(out)) }
-        if hasData {
-            out.append(raw.data)
-            // DDGST covers the DATA field only — never the header, never padding.
-            if ddgst > 0 { out.append(CRC32C.wireDigest(raw.data)) }
-        }
-        return out
+        if hdgst > 0 { head.append(CRC32C.wireDigest(head)) }
+        guard hasData else { return [head] }
+        // DDGST covers the DATA field only — never the header, never padding.
+        return ddgst > 0 ? [head, raw.data, CRC32C.wireDigest(raw.data)] : [head, raw.data]
     }
 }
 
@@ -98,11 +108,27 @@ public struct NVMeTCPDeframer: Sendable {
     /// The header (CH + PSH, at most 128 bytes) of the PDU most recently
     /// returned or being parsed when `next()` threw: what an H2CTermReq
     /// carries as its data (§3.5).
-    public private(set) var lastHeader = Data()
+    ///
+    /// Copied out only when asked for, or when its bytes are about to be
+    /// compacted away. It is wanted once in a connection's life, on the error
+    /// that ends it, and `next()` used to allocate it for every PDU.
+    public var lastHeader: Data {
+        guard let range = lastHeaderRange else { return keptHeader }
+        return Data(buffer.sub(range.lowerBound, range.count))
+    }
+
+    /// Where `lastHeader` is in `buffer`, while it still is.
+    private var lastHeaderRange: Range<Int>?
+    /// `lastHeader` once its bytes have left `buffer`.
+    private var keptHeader = Data()
 
     private mutating func compactIfNeeded() {
         guard consumed > 0 else { return }
         guard consumed >= Self.compactThreshold || consumed * 2 >= buffer.count else { return }
+        if let range = lastHeaderRange {
+            keptHeader = Data(buffer.sub(range.lowerBound, range.count))
+            lastHeaderRange = nil
+        }
         if consumed >= buffer.count {
             buffer = Data()
         } else {
@@ -123,7 +149,7 @@ public struct NVMeTCPDeframer: Sendable {
         let hlen = Int(header.hlen)
         let pdo = Int(header.pdo)
         let plen = Int(header.plen)
-        lastHeader = Data(buffer.sub(consumed, min(max(hlen, NVMeTCPHeader.size), avail, Self.maxTermReqDataBytes)))
+        lastHeaderRange = consumed ..< consumed + min(max(hlen, NVMeTCPHeader.size), avail, Self.maxTermReqDataBytes)
 
         guard plen <= maxPDUBytes else {
             throw NVMeTCPError.pduTooLarge(length: plen, limit: maxPDUBytes)

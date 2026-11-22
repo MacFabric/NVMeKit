@@ -327,3 +327,83 @@ struct NVMeTCPWireVectorTests {
         #expect(raw.dataDigestFailed)                       // non-fatal: delivered, marked
     }
 }
+
+@Suite("NVMe/TCP serialization in parts")
+struct NVMeSerializePartsTests {
+    /// The parts, joined, are the PDU: with and without digests, and when the
+    /// data is a slice of something larger.
+    @Test(arguments: [0, 1, 4096, 65536])
+    func partsJoinedAreThePDU(dataSize: Int) throws {
+        for digests in [NVMeTCPDigests(), NVMeTCPDigests(header: true, data: true),
+                        NVMeTCPDigests(header: false, data: true)] {
+            let buffer = Data((0 ..< dataSize + 9).map { UInt8(truncatingIfNeeded: $0 &* 13) })
+            let pdu = H2CDataPDU(cccid: 3, ttag: 5, dataOffset: 8192, data: buffer[9...], last: true)
+            let serializer = NVMeTCPSerializer(digests: digests)
+            let parts = serializer.serializeParts(pdu.encode())
+            let joined = parts.reduce(into: Data()) { $0.append($1) }
+            #expect(joined == serializer.serialize(pdu.encode()))
+            #expect(!parts.contains { $0.isEmpty })
+
+            var deframer = NVMeTCPDeframer(digests: digests)
+            for part in parts { deframer.append(part) }
+            let raw = try #require(try deframer.next())
+            #expect(!raw.dataDigestFailed)
+            #expect(raw.data == Data(buffer[9...]))
+            #expect(try H2CDataPDU(raw: raw).dataOffset == 8192)
+            #expect(deframer.buffered == 0)
+        }
+    }
+
+    /// The data is the caller's buffer, not a copy of it.
+    @Test func theDataIsNotCopied() {
+        let pdu = H2CDataPDU(cccid: 1, ttag: 1, dataOffset: 0,
+                             data: Data(repeating: 0x5A, count: 64 << 10), last: true)
+        let parts = NVMeTCPSerializer(digests: NVMeTCPDigests(header: true, data: true))
+            .serializeParts(pdu.encode())
+        #expect(parts.count == 3)
+        let original = pdu.data.withUnsafeBytes { $0.baseAddress }
+        #expect(parts[1].withUnsafeBytes { $0.baseAddress } == original)
+        #expect(parts[2].count == 4)
+    }
+}
+
+@Suite("NVMe/TCP deframer: the last header")
+struct NVMeLastHeaderTests {
+    private func capsuleResp(cid: UInt16) -> Data {
+        var cqe = Data(count: 16)
+        cqe.setLE16(cid, 12)
+        return NVMeTCPSerializer().serialize(CapsuleRespPDU(cqe: cqe).encode())
+    }
+
+    /// It names the PDU most recently returned, also after later appends
+    /// have compacted that PDU's bytes out of the buffer.
+    @Test func itSurvivesCompactionOfTheBytesItCameFrom() throws {
+        var deframer = NVMeTCPDeframer()
+        #expect(deframer.lastHeader.isEmpty)
+        let first = capsuleResp(cid: 1)
+        let second = capsuleResp(cid: 2)
+        deframer.append(first)
+        _ = try #require(try deframer.next())
+        #expect(deframer.lastHeader == first)
+        // Everything is consumed, so this append compacts the first PDU away.
+        deframer.append(second.prefix(4))
+        #expect(deframer.lastHeader == first)
+        #expect(try deframer.next() == nil)
+        #expect(deframer.lastHeader == first, "a header not yet whole is not the last header")
+        deframer.append(second.dropFirst(4))
+        _ = try #require(try deframer.next())
+        #expect(deframer.lastHeader == second)
+    }
+
+    /// When `next()` throws, it is the header that made it throw.
+    @Test func itIsTheHeaderBeingParsedWhenParsingFails() throws {
+        var deframer = NVMeTCPDeframer(maxPDUBytes: 64)
+        deframer.append(capsuleResp(cid: 1))
+        _ = try #require(try deframer.next())
+        // PLEN far past the limit.
+        let bad = Data([0x07, 0, 24, 24, 0, 0, 0x10, 0]) + Data(count: 16)
+        deframer.append(bad)
+        #expect(throws: NVMeTCPError.self) { _ = try deframer.next() }
+        #expect(deframer.lastHeader == bad)
+    }
+}
