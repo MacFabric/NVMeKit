@@ -407,3 +407,146 @@ struct NVMeLastHeaderTests {
         #expect(deframer.lastHeader == bad)
     }
 }
+
+/// `NVMeTCPDeframer` taken in steps must see exactly the PDUs `next()` sees
+/// in the same bytes, however those bytes are cut into chunks.
+@Suite("NVMe/TCP deframing in steps")
+struct NVMeStepwiseDeframerTests {
+    private static func bytes(_ count: Int, seed: Int) -> Data {
+        Data((0 ..< count).map { UInt8(truncatingIfNeeded: ($0 &* 131 &+ seed) ^ ($0 >> 7)) })
+    }
+
+    /// PDUs of every shape: no data, small and large data, a termination
+    /// request (never digested), one with padding before its data, and one
+    /// whose data digest is wrong.
+    private static func stream(_ digests: NVMeTCPDigests) -> Data {
+        let serializer = NVMeTCPSerializer(digests: digests)
+        var wire = Data()
+        var cqe = Data(count: 16)
+        cqe.setLE16(9, 12)
+        wire.append(serializer.serialize(CapsuleRespPDU(cqe: cqe).encode()))
+        for (index, size) in [1, 4096, 65536, 7].enumerated() {
+            wire.append(serializer.serialize(C2HDataPDU(
+                cccid: UInt16(index + 1), dataOffset: UInt32(index * 512),
+                data: bytes(size, seed: index), last: index % 2 == 0, success: false).encode()))
+        }
+        wire.append(serializer.serialize(
+            C2HTermReqPDU(fes: .pduSequenceError, fei: 3, offendingHeader: bytes(40, seed: 50)).encode()))
+        wire.append(serializer.serialize(CapsuleRespPDU(cqe: cqe).encode()))
+
+        // PDO past the header: eight bytes of padding the data digest does
+        // not cover. Only expressible by hand; the serializer never pads.
+        let hdgst = digests.header ? 4 : 0
+        let payload = bytes(100, seed: 60)
+        var padded = Data([0x07, 0, 24, UInt8(24 + hdgst + 8), 0, 0, 0, 0])
+        var flags: NVMeTCPFlags = []
+        if digests.header { flags.insert(.headerDigest) }
+        if digests.data { flags.insert(.dataDigest) }
+        padded.setU8(flags.rawValue, 1)
+        padded.setLE32(UInt32(24 + hdgst + 8 + payload.count + (digests.data ? 4 : 0)), 4)
+        var psh = Data(count: 16)
+        psh.setLE16(77, 0)
+        psh.setLE32(UInt32(payload.count), 8)
+        padded.append(psh)
+        if digests.header { padded.append(CRC32C.wireDigest(padded)) }
+        padded.append(Data(repeating: 0xFF, count: 8))
+        padded.append(payload)
+        if digests.data { padded.append(CRC32C.wireDigest(payload)) }
+        wire.append(padded)
+
+        // And one damaged in transit.
+        var damaged = serializer.serialize(C2HDataPDU(
+            cccid: 5, dataOffset: 0, data: bytes(300, seed: 70), last: true, success: false).encode())
+        damaged[damaged.count - 100] ^= 0x10
+        wire.append(damaged)
+        wire.append(serializer.serialize(CapsuleRespPDU(cqe: cqe).encode()))
+        return wire
+    }
+
+    @Test(arguments: [1, 7, 8, 9, 24, 28, 1000, 4096, 200_000])
+    func stepsSeeWhatNextSees(chunkSize: Int) throws {
+        for digests in [NVMeTCPDigests(), NVMeTCPDigests(header: true, data: true),
+                        NVMeTCPDigests(header: true, data: false), NVMeTCPDigests(header: false, data: true)] {
+            let wire = Self.stream(digests)
+            var whole = NVMeTCPDeframer(digests: digests)
+            whole.append(wire)
+            var expected: [RawNVMeTCPPDU] = []
+            while let raw = try whole.next() { expected.append(raw) }
+            #expect(expected.count == 10)
+            #expect(expected.filter(\.dataDigestFailed).count == (digests.data ? 1 : 0))
+
+            var deframer = NVMeTCPDeframer(digests: digests)
+            var got: [RawNVMeTCPPDU] = []
+            var head: NVMeTCPDeframer.Head?
+            var data = Data()
+            var index = 0
+            func pump() throws {
+                while true {
+                    if head == nil {
+                        guard let next = try deframer.nextHead() else { return }
+                        head = next
+                        data = Data()
+                    }
+                    guard let current = head else { return }
+                    var failed = false
+                    if index % 2 == 0 {
+                        guard let (taken, digestFailed) = deframer.takeData() else { return }
+                        data = taken
+                        failed = digestFailed
+                    } else {
+                        var piece = Data(count: 333)
+                        while deframer.dataRemaining > 0 {
+                            let moved = piece.withUnsafeMutableBytes { deframer.readData(into: $0) }
+                            if moved == 0 { return }
+                            data.append(piece.prefix(moved))
+                        }
+                        let end = deframer.finishData()
+                        if end == .needMore { return }
+                        failed = end == .digestFailed
+                    }
+                    var raw = RawNVMeTCPPDU(rawType: current.type, flags: current.flags, psh: current.psh, data: data)
+                    raw.dataDigestFailed = failed
+                    got.append(raw)
+                    // The header just consumed is the last header, as it is
+                    // for a PDU `next()` returns.
+                    #expect(deframer.lastHeader.prefix(8).u8(0) == current.type)
+                    head = nil
+                    index += 1
+                }
+            }
+            var fed = 0
+            while fed < wire.count {
+                let end = min(fed + chunkSize, wire.count)
+                deframer.append(wire[fed ..< end])
+                fed = end
+                try pump()
+            }
+            #expect(got == expected, "chunks of \(chunkSize), digests \(digests)")
+            #expect(deframer.buffered == 0)
+        }
+    }
+
+    /// The header is available before the data is: that is the point.
+    @Test func theHeaderComesBeforeItsData() throws {
+        let payload = Self.bytes(4096, seed: 5)
+        let wire = NVMeTCPSerializer().serialize(
+            C2HDataPDU(cccid: 21, dataOffset: 8192, data: payload, last: true, success: true).encode())
+        var deframer = NVMeTCPDeframer()
+        deframer.append(wire.prefix(23))
+        #expect(try deframer.nextHead() == nil)
+        deframer.append(wire[23 ..< 40])
+        let head = try #require(try deframer.nextHead())
+        #expect(head.psh.leU16(0) == 21)
+        #expect(head.dataLength == 4096)
+        #expect(head.flags == [.lastPDU, .success])
+        var sink = Data(count: 4096)
+        #expect(sink.withUnsafeMutableBytes { deframer.readData(into: $0) } == 16)
+        deframer.append(wire[40...])
+        let rest = sink.withUnsafeMutableBytes {
+            deframer.readData(into: UnsafeMutableRawBufferPointer(rebasing: $0[16...]))
+        }
+        #expect(rest == 4080)
+        #expect(deframer.finishData() == .good)
+        #expect(sink == payload)
+    }
+}

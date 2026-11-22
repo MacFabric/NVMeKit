@@ -42,7 +42,15 @@ public actor NVMeQueue {
         /// Bytes every R2T so far has asked for; the next one must start
         /// exactly here (NVMe/TCP 1.1 §3.3.2.2).
         var solicitedBytes = 0
-        var readBuffer: Data
+        /// Where C2HData is received: the caller's region, or one made here.
+        /// Not zeroed in advance; `complete` clears whatever was never
+        /// delivered before the bytes can be seen. nil for a command that
+        /// reads nothing.
+        let destination: ReadBuffer.Region?
+        /// The caller supplied `destination`, so the completion carries no data.
+        let callerOwnsDestination: Bool
+        /// Bytes the command asked for.
+        let expectedRead: Int
         /// C2HData bytes accepted so far; a successful completion must
         /// account for every byte or the read has silent zero-filled holes.
         /// Every PDU must start exactly here (NVMe/TCP 1.1 §3.3.2.1), so a
@@ -59,12 +67,29 @@ public actor NVMeQueue {
         var terminated = false
         let completion = Awaitable<NVMeCompletion>()
 
-        init(opcode: UInt8, writeData: Data, expectedRead: Int) {
+        init(opcode: UInt8, writeData: Data, expectedRead: Int, readInto: ReadBuffer.Region?) {
             self.opcode = opcode
             self.writeData = writeData
-            self.readBuffer = Data(count: expectedRead)
+            self.expectedRead = expectedRead
+            callerOwnsDestination = readInto != nil
+            destination = expectedRead > 0 ? (readInto ?? ReadBuffer(count: expectedRead).whole) : nil
         }
     }
+
+    /// A C2HData PDU whose header has been taken and whose data is still
+    /// arriving, and where that data is going.
+    private struct Inbound {
+        let head: NVMeTCPDeframer.Head
+        /// The command's own buffer, when the checks `handleC2HData` will
+        /// make have already been made; nil for every other PDU, whose data
+        /// is taken whole.
+        let placement: UnsafeMutableRawBufferPointer?
+        /// Keeps `placement`'s memory alive while it is being filled.
+        let owner: ReadBuffer?
+        var filled = 0
+    }
+
+    private var inbound: Inbound?
 
     /// A fatal transport error detected here (NVMe/TCP 1.1 §3.5): what the
     /// H2CTermReq says, and what the connection then closes with.
@@ -213,13 +238,21 @@ public actor NVMeQueue {
     /// data — in the capsule when it fits `inCapsuleLimit`, otherwise sent
     /// as H2CData when the controller's R2T asks; `expectedRead` bytes are
     /// collected from C2HData PDUs. The queue assigns the CID and the SGL.
-    public func submit(_ sqe: SQE, data: Data = Data(), expectedRead: Int = 0) async throws -> NVMeCompletion {
-        try await submit(sqe, data: data, expectedRead: expectedRead, forceInCapsule: false)
+    ///
+    /// `readInto`: a region at least `expectedRead` long to receive the data
+    /// in, typically one command's part of a buffer a large read shares
+    /// between its commands. The completion then carries no `data`. Without
+    /// one the queue allocates, and the completion's `data` is that memory,
+    /// not a copy of it.
+    public func submit(_ sqe: SQE, data: Data = Data(), expectedRead: Int = 0,
+                       readInto: ReadBuffer.Region? = nil) async throws -> NVMeCompletion {
+        try await submit(sqe, data: data, expectedRead: expectedRead, readInto: readInto, forceInCapsule: false)
     }
 
     /// `submit`, requiring a successful status.
-    public func submitChecked(_ sqe: SQE, data: Data = Data(), expectedRead: Int = 0) async throws -> NVMeCompletion {
-        let completion = try await submit(sqe, data: data, expectedRead: expectedRead)
+    public func submitChecked(_ sqe: SQE, data: Data = Data(), expectedRead: Int = 0,
+                              readInto: ReadBuffer.Region? = nil) async throws -> NVMeCompletion {
+        let completion = try await submit(sqe, data: data, expectedRead: expectedRead, readInto: readInto)
         let status = completion.cqe.status
         guard status.isSuccess else {
             throw BlockDeviceError.nvmeStatus(sct: status.sct, sc: status.sc, opcode: sqe.opcode)
@@ -227,8 +260,13 @@ public actor NVMeQueue {
         return completion
     }
 
-    private func submit(_ sqe: SQE, data: Data, expectedRead: Int, forceInCapsule: Bool) async throws -> NVMeCompletion {
+    private func submit(_ sqe: SQE, data: Data, expectedRead: Int, readInto: ReadBuffer.Region? = nil,
+                        forceInCapsule: Bool) async throws -> NVMeCompletion {
         try ensureOpen()
+        if let readInto, readInto.count < expectedRead {
+            throw NVMeConnectionError.protocolError(
+                "read of \(expectedRead) bytes given a destination of \(readInto.count)")
+        }
         try await waitForSlot()
         // Cancelled while waiting for a slot (or before): give the slot back
         // and stop, rather than reach `NetworkTransport.send`, whose
@@ -249,7 +287,8 @@ public actor NVMeQueue {
         } else if expectedRead > 0 {
             sqe.sgl = .transport(length: UInt32(expectedRead))
         }
-        let command = PendingCommand(opcode: sqe.opcode, writeData: data, expectedRead: expectedRead)
+        let command = PendingCommand(opcode: sqe.opcode, writeData: data, expectedRead: expectedRead,
+                                     readInto: readInto)
         pending[cid] = command
 
         let capsule = CapsuleCmdPDU(sqe: sqe.bytes, inCapsuleData: inCapsule ? data : Data())
@@ -391,9 +430,7 @@ public actor NVMeQueue {
         do {
             while state == .connected {
                 // Drain first: the IC exchange may have left a PDU buffered.
-                while let raw = try deframer.next() {
-                    try await handle(raw)
-                }
+                try await drain()
                 guard state == .connected else { return }
                 guard let chunk = try await transport.receive() else {
                     await close(reason: .connectionLost("EOF"))
@@ -429,12 +466,77 @@ public actor NVMeQueue {
         await close(reason: .protocolError(reason))
     }
 
+    /// Handle everything the buffered bytes allow: whole PDUs, and as much
+    /// of a C2HData's data as has arrived, moved straight into the buffer of
+    /// the read it answers. Returns when more bytes are needed.
+    ///
+    /// The state check each time round matters: once a queue is closing,
+    /// nothing more is written into a read's buffer, which is what lets a
+    /// caller that gave up on this queue retry elsewhere into the same
+    /// memory.
+    private func drain() async throws {
+        while state == .connected {
+            if inbound == nil {
+                guard let head = try deframer.nextHead() else { return }
+                guard head.dataLength > 0 else {
+                    try await handle(RawNVMeTCPPDU(rawType: head.type, flags: head.flags, psh: head.psh))
+                    continue
+                }
+                let target = placement(for: head)
+                inbound = Inbound(head: head, placement: target?.bytes, owner: target?.owner)
+            }
+            guard var current = inbound else { continue }
+            let head = current.head
+            guard let room = current.placement else {
+                guard let (data, digestFailed) = deframer.takeData() else { return }
+                inbound = nil
+                var raw = RawNVMeTCPPDU(rawType: head.type, flags: head.flags, psh: head.psh, data: data)
+                raw.dataDigestFailed = digestFailed
+                try await handle(raw)
+                continue
+            }
+            current.filled += deframer.readData(
+                into: UnsafeMutableRawBufferPointer(rebasing: room[current.filled...]))
+            inbound = current
+            guard deframer.dataRemaining == 0 else { return }
+            let end = deframer.finishData()
+            guard end != .needMore else { return }
+            inbound = nil
+            // `placement` only accepts a well-formed C2HData, so the fields
+            // can be read without the decoder, which would want the data.
+            try handleC2HData(
+                cccid: head.psh.leU16(0), dataOffset: head.psh.leU32(4), length: head.dataLength, data: nil,
+                last: head.flags.contains(.lastPDU), success: head.flags.contains(.success),
+                dataDigestFailed: end == .digestFailed)
+        }
+    }
+
+    /// Where the data of the C2HData PDU with this header belongs, if it is
+    /// one `handleC2HData` will accept as it stands: well formed, for a
+    /// command we are waiting on, next in its sequence, and inside its
+    /// buffer. Changes nothing. Anything else gets nil, is taken whole, and
+    /// is refused (or absorbed, for an abandoned command) with the reason.
+    private func placement(for head: NVMeTCPDeframer.Head)
+        -> (bytes: UnsafeMutableRawBufferPointer, owner: ReadBuffer)? {
+        guard head.type == NVMeTCPPDUType.c2hData.rawValue, head.psh.count == C2HDataPDU.pshSize,
+              Int(head.psh.leU32(8)) == head.dataLength,
+              let command = pending[head.psh.leU16(0)], !command.terminated, !command.dataComplete,
+              let destination = command.destination,
+              !head.flags.contains(.success) || head.flags.contains(.lastPDU)
+        else { return nil }
+        let offset = Int(head.psh.leU32(4))
+        guard offset == command.receivedBytes, head.dataLength <= command.expectedRead - offset else { return nil }
+        return (destination.bytes(offset ..< offset + head.dataLength), destination.buffer)
+    }
+
     private func handle(_ raw: RawNVMeTCPPDU) async throws {
         switch try AnyNVMeTCPPDU.decode(raw) {
         case .capsuleResp(let resp):
             try complete(try CQE(bytes: resp.cqe))
         case .c2hData(let pdu):
-            try handleC2HData(pdu, dataDigestFailed: raw.dataDigestFailed)
+            try handleC2HData(cccid: pdu.cccid, dataOffset: pdu.dataOffset, length: pdu.data.count,
+                              data: pdu.data, last: pdu.last, success: pdu.success,
+                              dataDigestFailed: raw.dataDigestFailed)
         case .r2t(let r2t):
             try handleR2T(r2t)
         case .c2hTermReq(let term):
@@ -469,47 +571,56 @@ public actor NVMeQueue {
         }
         // Success promises the data phase delivered everything; anything
         // less is a hole the pre-zeroed buffer would silently paper over.
-        if cqe.status.isSuccess, command.receivedBytes != command.readBuffer.count {
-            let reason = "read completed successfully with \(command.receivedBytes) of \(command.readBuffer.count) bytes delivered"
+        if cqe.status.isSuccess, command.receivedBytes != command.expectedRead {
+            let reason = "read completed successfully with \(command.receivedBytes) of \(command.expectedRead) bytes delivered"
             // The caller gets the error every other pending command gets when
             // the connection closes, so the controller recovers and retries
             // it; the private fatal error is for the read loop alone.
             command.completion.complete(.failure(NVMeConnectionError.protocolError(reason)))
             throw fatal(.pduSequenceError, reason)
         }
-        command.completion.complete(.success(NVMeCompletion(cqe: cqe, data: command.readBuffer)))
+        // What was not delivered is zeroed here, at the end, which is what
+        // the buffer being zeroed at the start used to provide.
+        var data = Data()
+        if let destination = command.destination {
+            destination.zero(min(command.receivedBytes, command.expectedRead) ..< command.expectedRead)
+            if !command.callerOwnsDestination { data = destination.data(prefix: command.expectedRead) }
+        }
+        command.completion.complete(.success(NVMeCompletion(cqe: cqe, data: data)))
     }
 
-    private func handleC2HData(_ pdu: C2HDataPDU, dataDigestFailed: Bool) throws {
-        guard let command = pending[pdu.cccid] else {
-            throw fatal(.invalidPDUHeader, fei: FieldOffset.cccid, "C2HData for unknown CID \(pdu.cccid)")
+    /// One C2HData PDU. `data` is nil when `drain` has already put its
+    /// `length` bytes in the command's buffer.
+    private func handleC2HData(cccid: UInt16, dataOffset: UInt32, length: Int, data: Data?,
+                               last: Bool, success: Bool, dataDigestFailed: Bool) throws {
+        guard let command = pending[cccid] else {
+            throw fatal(.invalidPDUHeader, fei: FieldOffset.cccid, "C2HData for unknown CID \(cccid)")
         }
         if dataDigestFailed { command.dataDigestFailed = true }
         guard !command.dataComplete else {
-            throw fatal(.pduSequenceError, "C2HData for CID \(pdu.cccid) after its LAST_PDU")
+            throw fatal(.pduSequenceError, "C2HData for CID \(cccid) after its LAST_PDU")
         }
-        guard !pdu.success || pdu.last else {
+        guard !success || last else {
             throw fatal(.invalidPDUHeader, fei: FieldOffset.flags,
-                        "C2HData for CID \(pdu.cccid) has SUCCESS set without LAST_PDU")
+                        "C2HData for CID \(cccid) has SUCCESS set without LAST_PDU")
         }
-        let offset = Int(pdu.dataOffset)
+        let offset = Int(dataOffset)
         guard offset == command.receivedBytes else {
             throw fatal(.pduSequenceError,
-                "non-contiguous C2HData for CID \(pdu.cccid): offset \(offset), expected \(command.receivedBytes)")
+                "non-contiguous C2HData for CID \(cccid): offset \(offset), expected \(command.receivedBytes)")
         }
-        let end = offset + pdu.data.count
-        guard end <= command.readBuffer.count else {
+        guard length <= command.expectedRead - offset else {
             throw fatal(.dataTransferOutOfRange,
-                "C2HData outside the read buffer (offset \(offset), \(pdu.data.count) bytes of \(command.readBuffer.count))")
+                "C2HData outside the read buffer (offset \(offset), \(length) bytes of \(command.expectedRead))")
         }
-        if !command.terminated {
-            command.readBuffer.setSub(pdu.data, offset)
+        if let data, !command.terminated {
+            command.destination?.write(data, at: offset)
         }
-        command.receivedBytes += pdu.data.count
-        command.dataComplete = pdu.last
-        if pdu.success {
+        command.receivedBytes += length
+        command.dataComplete = last
+        if success {
             // No CapsuleResp follows: this PDU is the completion.
-            try complete(CQE(sqID: queueID, commandID: pdu.cccid, status: .success))
+            try complete(CQE(sqID: queueID, commandID: cccid, status: .success))
         }
     }
 
@@ -552,6 +663,9 @@ public actor NVMeQueue {
         guard state != .closed else { return }
         state = .closed
         closeReason = reason
+        // Whatever C2HData was part-way in stays where it got to: `drain`
+        // stops at the state it has just been given.
+        inbound = nil
         readLoop?.cancel()
         await transport.close()
 
