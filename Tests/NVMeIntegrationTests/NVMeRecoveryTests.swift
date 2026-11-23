@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import Testing
 @testable import NVMeMockTarget
 @testable import NVMeKit
@@ -98,13 +99,22 @@ struct NVMeRecoveryTests {
         let fleet = NVMeFleet(config: config, faultScripts: [Self.healthy, stall, Self.healthy])
         var policy = testPolicy(retries: 1, recoveryAttempts: 2)
         policy.taskTimeout = .milliseconds(300)
-        let controller = try await activatedController(fleet: fleet, policy: policy)
+        let lines = Mutex<[String]>([])
+        let controller = try await activatedController(fleet: fleet, policy: policy) {
+            $0.debugLog = { line in lines.withLock { $0.append(line) } }
+        }
         let device = NVMeBlockDevice(controller: controller, nsid: 1)
         _ = try await device.readCapacity()
 
         let pattern = Data((0 ..< 8192).map { UInt8(($0 &* 11) & 0xFF) })
         // Bounded here too, so a missing task deadline fails rather than hangs.
         try await withDeadline(.seconds(10)) { try await device.write(offset: 0, data: pattern) }
+        let output = lines.withLock { $0 }
+        let retry = output.firstIndex {
+            $0.contains("retrying queue=io attempt=1") && $0.contains("error=taskTimedOut")
+        }
+        let finish = output.firstIndex { $0.contains("finished queue=io attempt=2") }
+        #expect(try #require(retry) < #require(finish))
         #expect(await fleet.subsystem.r2tsSent == 2)           // one swallowed, one answered
         #expect(await controller.recoveryCount == 1)
         #expect(try await device.read(offset: 0, length: 8192) == pattern)

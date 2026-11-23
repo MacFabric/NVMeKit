@@ -5,6 +5,8 @@ import Foundation
 public struct NVMeCompletion: Sendable {
     public let cqe: CQE
     public let data: Data
+    let receivedBytes: Int
+    let connectionID: UUID?
 }
 
 /// One NVMe/TCP connection, which is one queue pair: ICReq/ICResp, then a
@@ -114,6 +116,8 @@ public actor NVMeQueue {
     }
 
     private let transport: any ConnectionTransport
+    private let connectionID: UUID?
+    private let debugLog: (@Sendable (String) -> Void)?
     public let queueID: UInt16
     /// SQ entries as sent in Connect. The controller is told SQSIZE−1 and
     /// may have at most that many commands outstanding, so that is the
@@ -141,9 +145,19 @@ public actor NVMeQueue {
     private var readLoop: Task<Void, Never>?
 
     public init(transport: any ConnectionTransport, queueID: UInt16, entries: UInt16,
-                requestDigests: Bool, maxPDUBytes: Int, inCapsuleLimit: Int = 8192) {
+                requestDigests: Bool, maxPDUBytes: Int, inCapsuleLimit: Int = 8192,
+                debugLog: (@Sendable (String) -> Void)? = nil) {
         precondition(entries >= 2, "a queue needs room for at least one command")
         self.transport = transport
+        if let debugLog {
+            let connectionID = (transport as? NVMeTracingTransport)?.connectionID
+            self.connectionID = connectionID
+            let prefix = "connection=\(connectionID?.uuidString ?? "-") "
+            self.debugLog = { message in debugLog(prefix + message) }
+        } else {
+            self.connectionID = nil
+            self.debugLog = nil
+        }
         self.queueID = queueID
         self.entries = entries
         self.requestDigests = requestDigests
@@ -254,6 +268,8 @@ public actor NVMeQueue {
                               readInto: ReadBuffer.Region? = nil) async throws -> NVMeCompletion {
         let completion = try await submit(sqe, data: data, expectedRead: expectedRead, readInto: readInto)
         let status = completion.cqe.status
+        debugLog?("NVMeQueue.\(#function) queueID=\(queueID) cid=\(completion.cqe.commandID)"
+                  + " sct=\(status.sct) sc=\(status.sc) receivedBytes=\(completion.receivedBytes)")
         guard status.isSuccess else {
             throw BlockDeviceError.nvmeStatus(sct: status.sct, sc: status.sc, opcode: sqe.opcode)
         }
@@ -291,13 +307,28 @@ public actor NVMeQueue {
                                      readInto: readInto)
         pending[cid] = command
 
+        if let debugLog {
+            let lba = queueID != 0 && sqe.opcode == NVMeOpcode.NVM.read
+                ? " lba=\(UInt64(sqe.cdw11) << 32 | UInt64(sqe.cdw10))" : ""
+            debugLog("NVMeQueue.\(#function) queueID=\(queueID) cid=\(cid) \(sqe.logCommandFields)\(lba)"
+                     + " dataBytes=\(data.count) expectedRead=\(expectedRead) forceInCapsule=\(forceInCapsule)")
+        }
         let capsule = CapsuleCmdPDU(sqe: sqe.bytes, inCapsuleData: inCapsule ? data : Data())
-        try await sendRaw(serializer.serializeParts(capsule.encode()))
+        do {
+            try await sendRaw(serializer.serializeParts(capsule.encode()))
 
-        return try await withTaskCancellationHandler {
-            try await suspend(command.completion)
-        } onCancel: {
-            Task { await self.tombstone(cid: cid) }
+            let completion = try await withTaskCancellationHandler {
+                try await suspend(command.completion)
+            } onCancel: {
+                Task { await self.tombstone(cid: cid) }
+            }
+            debugLog?("NVMeQueue.\(#function) resumed queueID=\(queueID) cid=\(cid)"
+                      + " receivedBytes=\(completion.receivedBytes)")
+            return completion
+        } catch {
+            debugLog?("NVMeQueue.\(#function) \(error is CancellationError ? "cancelled" : "failed")"
+                      + " queueID=\(queueID) cid=\(cid) error=\(error)")
+            throw error
         }
     }
 
@@ -530,6 +561,7 @@ public actor NVMeQueue {
     }
 
     private func handle(_ raw: RawNVMeTCPPDU) async throws {
+        debugLog?("NVMeQueue.\(#function) queueID=\(queueID) type=\(raw.type)")
         switch try AnyNVMeTCPPDU.decode(raw) {
         case .capsuleResp(let resp):
             try complete(try CQE(bytes: resp.cqe))
@@ -586,13 +618,21 @@ public actor NVMeQueue {
             destination.zero(min(command.receivedBytes, command.expectedRead) ..< command.expectedRead)
             if !command.callerOwnsDestination { data = destination.data(prefix: command.expectedRead) }
         }
-        command.completion.complete(.success(NVMeCompletion(cqe: cqe, data: data)))
+        debugLog?("NVMeQueue.\(#function) queueID=\(queueID) cid=\(cqe.commandID)"
+                  + " sct=\(cqe.status.sct) sc=\(cqe.status.sc)"
+                  + " receivedBytes=\(command.receivedBytes) expectedRead=\(command.expectedRead)")
+        let completion = NVMeCompletion(cqe: cqe, data: data,
+                                        receivedBytes: command.receivedBytes, connectionID: connectionID)
+        command.completion.complete(.success(completion))
     }
 
     /// One C2HData PDU. `data` is nil when `drain` has already put its
     /// `length` bytes in the command's buffer.
     private func handleC2HData(cccid: UInt16, dataOffset: UInt32, length: Int, data: Data?,
                                last: Bool, success: Bool, dataDigestFailed: Bool) throws {
+        debugLog?("NVMeQueue.\(#function) queueID=\(queueID) cid=\(cccid) offset=\(dataOffset)"
+                  + " bytes=\(length) last=\(last) success=\(success)"
+                  + " dataDigestFailed=\(dataDigestFailed)")
         guard let command = pending[cccid] else {
             throw fatal(.invalidPDUHeader, fei: FieldOffset.cccid, "C2HData for unknown CID \(cccid)")
         }

@@ -6,6 +6,8 @@ public struct NVMeControllerConfig: Sendable {
     public var subsystemNQN: String
     /// Offer header and data digests in ICReq; the controller picks.
     public var requestDigests = true
+    /// Optional function-level diagnostics. The sink may be called concurrently.
+    public var debugLog: (@Sendable (String) -> Void)?
     /// I/O queue depth to ask for, clamped to CAP.MQES.
     public var ioQueueEntries: UInt16 = 128
     /// I/O queues to ask for, each a TCP connection of its own with its own
@@ -47,6 +49,7 @@ public actor NVMeController {
     private let makeTransport: TransportFactory
     private let config: NVMeControllerConfig
     private let policy: SessionPolicy
+    nonisolated let debugLog: (@Sendable (String) -> Void)?
 
     private var admin: NVMeQueue?
     /// The I/O queues, QID 1 upward. Empty while there is no controller.
@@ -77,6 +80,7 @@ public actor NVMeController {
                 transportFactory: @escaping TransportFactory) {
         self.config = config
         self.policy = policy
+        self.debugLog = config.debugLog
         self.makeTransport = transportFactory
     }
 
@@ -176,16 +180,25 @@ public actor NVMeController {
 
     private func execute(on kind: QueueKind, _ sqe: SQE, data: Data, expectedRead: Int,
                          readInto: ReadBuffer.Region? = nil) async throws -> NVMeCompletion {
+        debugLog?("NVMeController.\(#function) queue=\(kind) \(sqe.logCommandFields)"
+                  + " dataBytes=\(data.count) expectedRead=\(expectedRead)")
         var attempt = 0
         while true {
             let queue = try await ensureActive(kind)
             do {
-                return try await withDeadline(policy.taskTimeout) {
+                let completion = try await withDeadline(policy.taskTimeout) {
                     try await queue.submitChecked(sqe, data: data, expectedRead: expectedRead, readInto: readInto)
                 }
+                debugLog?("NVMeController.\(#function) finished queue=\(kind) attempt=\(attempt + 1)"
+                          + " connection=\(completion.connectionID?.uuidString ?? "-") cid=\(completion.cqe.commandID)"
+                          + " receivedBytes=\(completion.receivedBytes)")
+                return completion
             } catch let error as NVMeConnectionError {
                 try Task.checkCancellation()
-                guard !loggedOut, attempt < policy.taskRetries else { throw error }
+                let willRetry = !loggedOut && attempt < policy.taskRetries
+                debugLog?("NVMeController.\(#function) \(willRetry ? "retrying" : "failed") queue=\(kind) attempt=\(attempt + 1)"
+                          + " \(sqe.logCommandFields) error=\(error)")
+                guard willRetry else { throw error }
                 attempt += 1
                 try await recover(after: error, on: queue)
             } catch BlockDeviceError.nvmeStatus(let sct, let sc, let opcode)
@@ -193,9 +206,11 @@ public actor NVMeController {
                 // Matched on SCT/SC alone: a controller-sent 22h with DNR set
                 // is retried too, which is harmless for idempotent block I/O.
                 try Task.checkCancellation()
-                guard !loggedOut, attempt < policy.taskRetries else {
-                    throw BlockDeviceError.nvmeStatus(sct: sct, sc: sc, opcode: opcode)
-                }
+                let error = BlockDeviceError.nvmeStatus(sct: sct, sc: sc, opcode: opcode)
+                let willRetry = !loggedOut && attempt < policy.taskRetries
+                debugLog?("NVMeController.\(#function) \(willRetry ? "retrying" : "failed") queue=\(kind) attempt=\(attempt + 1)"
+                          + " \(sqe.logCommandFields) error=\(error)")
+                guard willRetry else { throw error }
                 attempt += 1
             } catch is DeadlineError {
                 try Task.checkCancellation()
@@ -206,12 +221,19 @@ public actor NVMeController {
                 await queue.close()
                 // No usable Abort on NVMe-oF: drop the pair rather than let a
                 // wedge be inherited, and rebuild on the next attempt.
-                guard !loggedOut, attempt < policy.taskRetries else {
+                let willRetry = !loggedOut && attempt < policy.taskRetries
+                debugLog?("NVMeController.\(#function) \(willRetry ? "retrying" : "failed") queue=\(kind) attempt=\(attempt + 1)"
+                          + " \(sqe.logCommandFields) error=\(SessionError.taskTimedOut)")
+                guard willRetry else {
                     await dropQueues()
                     throw SessionError.taskTimedOut
                 }
                 attempt += 1
                 try await recover(after: nil, on: queue)
+            } catch {
+                debugLog?("NVMeController.\(#function) failed queue=\(kind) attempt=\(attempt + 1)"
+                          + " \(sqe.logCommandFields) error=\(error)")
+                throw error
             }
         }
     }
@@ -263,6 +285,7 @@ public actor NVMeController {
     // MARK: - Bring-up
 
     private func ensureActive(_ kind: QueueKind) async throws -> NVMeQueue {
+        debugLog?("NVMeController.\(#function) queue=\(kind)")
         if loggedOut { throw SessionError.loggedOut }
         if let recoveryFailed { throw recoveryFailed }
         if let queue = queue(kind) { return queue }
@@ -329,7 +352,7 @@ public actor NVMeController {
     private func establish() async throws {
         let adminQueue = NVMeQueue(
             transport: try await makeTransport(), queueID: 0, entries: config.adminQueueEntries,
-            requestDigests: config.requestDigests, maxPDUBytes: Self.adminPDULimit)
+            requestDigests: config.requestDigests, maxPDUBytes: Self.adminPDULimit, debugLog: debugLog)
         do {
             let (cntlid, cap) = try await Self.bringUpAdminQueue(
                 adminQueue, host: config.host, subsystemNQN: config.subsystemNQN, keepAliveMS: keepAliveMS,
@@ -364,7 +387,7 @@ public actor NVMeController {
                 for qid in 1 ... min(wanted, granted) {
                     let ioQueue = NVMeQueue(
                         transport: try await makeTransport(), queueID: UInt16(qid), entries: max(entries, 2),
-                        requestDigests: config.requestDigests, maxPDUBytes: Self.ioPDULimit)
+                        requestDigests: config.requestDigests, maxPDUBytes: Self.ioPDULimit, debugLog: debugLog)
                     opened.append(ioQueue)
                     let host = config.host, subsystemNQN = config.subsystemNQN
                     _ = try await withDeadline(policy.loginTimeout, onTimeout: { await ioQueue.close() }) {

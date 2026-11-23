@@ -90,6 +90,13 @@ public struct SQE: Sendable, Equatable {
         set { bytes.setU8(newValue, 4) }
     }
 
+    var logCommandFields: String {
+        if opcode == NVMeOpcode.Admin.fabrics {
+            return String(format: "opcode=0x%02x fctype=0x%02x", opcode, fabricsType)
+        }
+        return String(format: "opcode=0x%02x nsid=%u", opcode, nsid)
+    }
+
     /// Setting the SGL also sets PSDT = 01b, which nvmet insists on for every
     /// command including ones without data.
     public var sgl: SGLDescriptor {

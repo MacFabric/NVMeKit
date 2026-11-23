@@ -5,6 +5,7 @@ import Foundation
 /// bound, and FUA on every write when `writeThrough` is set.
 public actor NVMeBlockDevice: BlockDeviceBackend {
     private let controller: NVMeController
+    private let debugLog: (@Sendable (String) -> Void)?
     public let nsid: UInt32
     private var cachedBlockSize: Int = 0
     private var cachedBlockCount: UInt64 = 0
@@ -26,6 +27,7 @@ public actor NVMeBlockDevice: BlockDeviceBackend {
     public init(controller: NVMeController, nsid: UInt32, maxTransferBytes: Int = 256 << 10,
                 writeThrough: Bool = false) {
         self.controller = controller
+        self.debugLog = controller.debugLog
         self.nsid = nsid
         self.requestedMaxTransferBytes = min(maxTransferBytes, NVMeController.maxIOTransferBytes)
         self.writeThrough = writeThrough
@@ -38,6 +40,7 @@ public actor NVMeBlockDevice: BlockDeviceBackend {
 
     /// Identify Namespace, cached after the first call.
     public func readCapacity() async throws -> (blockSize: Int, blockCount: UInt64) {
+        debugLog?("NVMeBlockDevice.\(#function) nsid=\(nsid) cached=\(capacityKnown)")
         if capacityKnown { return (cachedBlockSize, cachedBlockCount) }
         let (blockSize, blockCount) = try await controller.identifyNamespace(nsid)
         cachedBlockSize = blockSize
@@ -55,10 +58,15 @@ public actor NVMeBlockDevice: BlockDeviceBackend {
     }
 
     private func maxTransferBytes() async -> Int {
-        min(requestedMaxTransferBytes, await controller.maxTransferBytes ?? Int.max)
+        let mdts = await controller.maxTransferBytes
+        let limit = min(requestedMaxTransferBytes, mdts ?? Int.max)
+        debugLog?("NVMeBlockDevice.\(#function) requested=\(requestedMaxTransferBytes) "
+                             + "mdts=\(mdts.map { String($0) } ?? "unlimited") limit=\(limit)")
+        return limit
     }
 
     public func read(offset: UInt64, length: Int) async throws -> Data {
+        debugLog?("NVMeBlockDevice.\(#function) nsid=\(nsid) offset=\(offset) length=\(length)")
         let (bs, count) = try await readCapacity()
         try validate(offset: offset, length: length, blockSize: bs, capacity: count)
         // A Read's block count is 0-based (`NVMeCommands.read` traps on 0),
@@ -67,9 +75,14 @@ public actor NVMeBlockDevice: BlockDeviceBackend {
         let blocksPerChunk = max(1, await maxTransferBytes() / bs)
         let firstLBA = offset / UInt64(bs)
         let totalBlocks = length / bs
+        debugLog?("NVMeBlockDevice.\(#function)"
+                             + " blockSize=\(bs) firstLBA=\(firstLBA) totalBlocks=\(totalBlocks) blocksPerChunk=\(blocksPerChunk)")
 
         if totalBlocks <= blocksPerChunk {
-            return try await readChunk(lba: firstLBA, blocks: totalBlocks, blockSize: bs)
+            let data = try await readChunk(lba: firstLBA, blocks: totalBlocks, blockSize: bs)
+            debugLog?("NVMeBlockDevice.\(#function) finished nsid=\(nsid)"
+                                 + " offset=\(offset) receivedBytes=\(data.count)")
+            return data
         }
 
         // Several commands, issued together. Each is given its own part of
@@ -96,16 +109,27 @@ public actor NVMeBlockDevice: BlockDeviceBackend {
             }
             try await group.waitForAll()
         }
-        return buffer.data()
+        let data = buffer.data()
+        debugLog?("NVMeBlockDevice.\(#function) finished nsid=\(nsid)"
+                             + " offset=\(offset) receivedBytes=\(data.count)")
+        return data
     }
 
     /// One Read. With `region` the data is received there and the returned
     /// `Data` is empty; without, the result is the command's own buffer.
     private func readChunk(lba: UInt64, blocks: Int, blockSize bs: Int,
                            into region: ReadBuffer.Region? = nil) async throws -> Data {
-        let completion = try await controller.execute(
-            NVMeCommands.read(commandID: 0, nsid: nsid, slba: lba, blocks: UInt32(blocks), blockSize: bs),
-            expectedRead: blocks * bs, readInto: region)
+        let expectedRead = blocks * bs
+        let sqe = NVMeCommands.read(commandID: 0, nsid: nsid, slba: lba, blocks: UInt32(blocks), blockSize: bs)
+        guard let debugLog else {
+            return try await controller.execute(sqe, expectedRead: expectedRead, readInto: region).data
+        }
+        debugLog("NVMeBlockDevice.\(#function) nsid=\(nsid) lba=\(lba) blocks=\(blocks)"
+                 + " blockSize=\(bs) expectedRead=\(expectedRead)")
+        let completion = try await controller.execute(sqe, expectedRead: expectedRead, readInto: region)
+        debugLog("NVMeBlockDevice.\(#function) finished nsid=\(nsid) lba=\(lba)"
+                 + " connection=\(completion.connectionID?.uuidString ?? "-")"
+                 + " cid=\(completion.cqe.commandID) receivedBytes=\(completion.receivedBytes)")
         return completion.data
     }
 
@@ -169,6 +193,8 @@ public actor NVMeBlockDevice: BlockDeviceBackend {
     }
 
     private func validate(offset: UInt64, length: Int, blockSize: Int, capacity: UInt64) throws {
+        debugLog?("NVMeBlockDevice.\(#function) offset=\(offset) length=\(length) "
+                             + "blockSize=\(blockSize) blockCount=\(capacity)")
         try BlockRequest.validate(offset: offset, length: length,
                                   blockSize: blockSize, capacity: capacity)
     }
