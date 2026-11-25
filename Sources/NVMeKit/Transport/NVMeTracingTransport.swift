@@ -4,7 +4,8 @@ import Foundation
 /// wire fields, including the controller's original status on locally failed reads.
 public final class NVMeTracingTransport: ConnectionTransport, @unchecked Sendable {
     private let inner: any ConnectionTransport
-    private let label: String
+    private let logPrefix: String
+    let connectionID: UUID?
     private let sink: @Sendable (String) -> Void
     private let describeFailure: @Sendable (BlockDeviceError) -> String
     public enum Level: Sendable { case useful, debug }
@@ -23,12 +24,14 @@ public final class NVMeTracingTransport: ConnectionTransport, @unchecked Sendabl
         _ inner: any ConnectionTransport,
         label: String = "nvme",
         level: Level = .debug,
+        connectionID: UUID? = nil,
         sink: @escaping @Sendable (String) -> Void = { FileHandle.standardError.write(Data(($0 + "\n").utf8)) },
         describeFailure: @escaping @Sendable (BlockDeviceError) -> String = NVMeTracingTransport.statusDescription
     ) {
         self.level = level
         self.inner = inner
-        self.label = label
+        self.connectionID = connectionID
+        self.logPrefix = connectionID.map { "[\(label)] connection=\($0.uuidString)" } ?? "[\(label)]"
         self.describeFailure = describeFailure
         self.sink = sink
     }
@@ -56,7 +59,7 @@ public final class NVMeTracingTransport: ConnectionTransport, @unchecked Sendabl
     }
 
     public func close() async {
-        sink("[\(label)] close")
+        sink("\(logPrefix) close")
         await inner.close()
     }
 
@@ -84,7 +87,7 @@ public final class NVMeTracingTransport: ConnectionTransport, @unchecked Sendabl
         }
         lock.unlock()
         for line in lines {
-            sink("[\(label)] \(direction) \(line)")
+            sink("\(logPrefix) \(direction) \(line)")
         }
     }
 
